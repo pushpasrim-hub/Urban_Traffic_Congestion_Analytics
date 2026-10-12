@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 420" role="img" aria-labelledby="title desc">
+  <title id="title">Illustrative urban road network</title>
+  <desc id="desc">A non-geographic illustration of streets between city blocks.</desc>
+  <rect width="760" height="420" rx="12" fill="#e8efeb"/>
+  <g fill="#cbd8d1">
+    <rect x="44" y="38" width="150" height="82" rx="5"/><rect x="220" y="38" width="105" height="82" rx="5"/>
+    <rect x="435" y="38" width="112" height="82" rx="5"/><rect x="575" y="38" width="142" height="82" rx="5"/>
+    <rect x="44" y="154" width="150" height="90" rx="5"/><rect x="220" y="154" width="105" height="90" rx="5"/>
+    <rect x="435" y="154" width="112" height="90" rx="5"/><rect x="575" y="154" width="142" height="90" rx="5"/>
+    <rect x="44" y="278" width="150" height="94" rx="5"/><rect x="220" y="278" width="105" height="94" rx="5"/>
+    <rect x="435" y="278" width="112" height="94" rx="5"/><rect x="575" y="278" width="142" height="94" rx="5"/>
+  </g>
+  <path d="M0 135h760M0 261h760M207 0v420M337 0v420M560 0v420" stroke="#fff" stroke-width="20"/>
+  <path d="M0 198h760" stroke="#146b58" stroke-width="13" stroke-linecap="round"/>
+  <path d="M94 198h143M368 198h122M626 198h93" stroke="#d8ed87" stroke-width="3" stroke-dasharray="12 11"/>
+  <path d="M490 198c0-43 35-78 78-78" fill="none" stroke="#c95c45" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="490" cy="198" r="10" fill="#c95c45"/><circle cx="568" cy="120" r="10" fill="#c95c45"/>
+  <g fill="#172b2a" font-family="Arial,sans-serif" font-size="12" font-weight="700">
+    <text x="28" y="402">ILLUSTRATIVE NETWORK · NOT LIVE MAP DATA</text>
+    <text x="508" y="224" fill="#146b58">ROAD SEGMENTS</text>
+  </g>
+</svg>
