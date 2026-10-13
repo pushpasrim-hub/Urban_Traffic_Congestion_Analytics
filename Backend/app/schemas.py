@@ -127,6 +127,8 @@ class PredictionRequest(InputModel):
     speed_kmh: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     vehicle_count: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     current_congestion_level: CongestionLevel | None = None
+    weather_condition: str | None = Field(default=None, max_length=100)
+    rainfall_mm: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     save: bool = True
 
     @field_validator("predicted_for")
@@ -135,8 +137,19 @@ class PredictionRequest(InputModel):
         return to_database_datetime(value)
 
 
-class WhatIfRequest(PredictionRequest):
-    save: Literal[False] = False
+class TrafficScenarioRequest(InputModel):
+    segment_id: int = Field(gt=0)
+    predicted_for: datetime
+    speed_kmh: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    vehicle_count: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    current_congestion_level: CongestionLevel | None = None
+    weather_condition: str | None = Field(default=None, max_length=100)
+    rainfall_mm: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+    @field_validator("predicted_for")
+    @classmethod
+    def normalize_predicted_for(cls, value: datetime) -> datetime:
+        return to_database_datetime(value)
 
 
 def to_database_datetime(value: datetime) -> datetime:
