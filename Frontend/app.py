@@ -494,17 +494,45 @@ def ml_panel(segments: list[dict[str, Any]]) -> None:
             st.caption(f"Chronological holdout: {model.get('training_rows')} training rows, {model.get('validation_rows')} later validation rows.")
             metrics = model.get("metrics", {})
             if model_name == "congestion":
-                metric_cols = st.columns(2)
+                metric_cols = st.columns(4)
                 metric_cols[0].metric("Validation accuracy", f"{metrics['accuracy']:.3f}" if metrics.get("accuracy") is not None else "N/A")
-                metric_cols[1].metric("Weighted F1", f"{metrics['f1_weighted']:.3f}" if metrics.get("f1_weighted") is not None else "N/A")
+                metric_cols[1].metric("Weighted precision", f"{metrics['precision_weighted']:.3f}" if metrics.get("precision_weighted") is not None else "N/A")
+                metric_cols[2].metric("Weighted recall", f"{metrics['recall_weighted']:.3f}" if metrics.get("recall_weighted") is not None else "N/A")
+                metric_cols[3].metric("Weighted F1", f"{metrics['f1_weighted']:.3f}" if metrics.get("f1_weighted") is not None else "N/A")
+                labels = metrics.get("confusion_matrix_labels", [])
+                matrix = metrics.get("confusion_matrix")
+                if labels and matrix:
+                    st.caption("Confusion matrix · rows are actual labels, columns are predicted labels.")
+                    st.dataframe(pd.DataFrame(matrix, index=labels, columns=labels), use_container_width=True)
             else:
                 unit = model.get("unit", "")
                 metric_cols = st.columns(3)
                 metric_cols[0].metric("Validation MAE", f"{metrics['mae']:.2f} {unit}" if metrics.get("mae") is not None else "N/A")
                 metric_cols[1].metric("Validation RMSE", f"{metrics['rmse']:.2f} {unit}" if metrics.get("rmse") is not None else "N/A")
                 metric_cols[2].metric("R²", f"{metrics['r2']:.3f}" if metrics.get("r2") is not None else "N/A")
+                baseline = model.get("baseline", {}).get("metrics", {})
+                if baseline:
+                    st.caption(
+                        f"Dummy baseline — MAE {baseline.get('mae', float('nan')):.2f} {unit}; "
+                        f"RMSE {baseline.get('rmse', float('nan')):.2f} {unit}; "
+                        f"R² {baseline.get('r2', float('nan')):.3f}."
+                    )
+            if model_name == "congestion":
+                baseline = model.get("baseline", {}).get("metrics", {})
+                if baseline:
+                    st.caption(
+                        f"Most-frequent baseline — accuracy {baseline.get('accuracy', float('nan')):.3f}; "
+                        f"weighted precision {baseline.get('precision_weighted', float('nan')):.3f}; "
+                        f"weighted recall {baseline.get('recall_weighted', float('nan')):.3f}; "
+                        f"weighted F1 {baseline.get('f1_weighted', float('nan')):.3f}."
+                    )
+                unseen = model.get("validation_labels_not_seen_in_training", [])
+                if unseen:
+                    st.warning("The chronological validation period includes labels absent from the training period: " + ", ".join(unseen))
             st.caption("Features: " + ", ".join(model.get("feature_names", [])))
-    st.caption("Regression MAE/RMSE use each target's units. Classifier accuracy and weighted F1 appear only when the chronological validation window supports them.")
+    for limitation in status.get("limitations", []):
+        st.caption(f"Limitation: {limitation}")
+    st.caption("Metrics are measured on a later chronological holdout and compared with simple dummy baselines; they are not guarantees of future performance.")
     if st.button("Train / retrain model", type="primary", key="train_model"):
         with st.spinner("Training from chronological traffic history..."):
             try:
@@ -528,6 +556,7 @@ def ml_panel(segments: list[dict[str, Any]]) -> None:
         prediction_date = st.date_input("Prediction date", value=datetime.now().date() + timedelta(days=1), key="prediction_date")
         prediction_time = st.time_input("Prediction time", value=datetime.now().replace(minute=0, second=0, microsecond=0).time(), key="prediction_time")
         save = st.checkbox("Save prediction to MySQL", value=True)
+        include_what_if = st.checkbox("Include hypothetical what-if comparisons", value=True)
         submit = st.form_submit_button("Predict", type="primary")
     if submit:
         try:
@@ -588,6 +617,39 @@ def ml_panel(segments: list[dict[str, Any]]) -> None:
             if result.get("unsupported_persistence_fields"):
                 st.warning("Predicted vehicle count was returned for this request but not saved: traffic_predictions has no predicted_vehicle_count column. The existing schema was not changed.")
             st.caption("Model outputs and metrics are based only on the trained pipeline and historical MySQL readings.")
+            if include_what_if:
+                st.subheader("Hypothetical what-if comparisons")
+                st.caption("Scenario changes are model simulations, not proven causal effects.")
+                try:
+                    with st.spinner("Comparing supported hypothetical scenarios..."):
+                        scenario_result = api().post("ml/what-if", {
+                            "segment_id": segment_id,
+                            "predicted_for": payload["predicted_for"],
+                            "save": False,
+                        })
+                except APIError as scenario_error:
+                    show_api_error(scenario_error)
+                    st.warning(f"The prediction succeeded, but scenario analysis is unavailable: {scenario_error}")
+                else:
+                    st.caption(scenario_result.get("interpretation", "Hypothetical scenario results."))
+                    for scenario in scenario_result.get("scenarios", []):
+                        st.markdown(f"**{scenario.get('name', 'Scenario').replace('_', ' ').title()}**")
+                        if not scenario.get("supported"):
+                            st.info(scenario.get("detail", "This scenario is not supported by the trained model and available data."))
+                            continue
+                        st.caption("Hypothetical scenario input: " + str(scenario.get("input_vehicle_count", "N/A")) + " vehicles per reading.")
+                        predictions = scenario.get("predictions", {})
+                        comparison_rows = [
+                            {"Output": label, **predictions.get(key, {})}
+                            for key, label in (
+                                ("predicted_travel_time_minutes", "Travel time (minutes)"),
+                                ("predicted_vehicle_count", "Traffic volume (vehicles per reading)"),
+                                ("predicted_congestion_level", "Congestion level"),
+                            )
+                            if key in predictions
+                        ]
+                        if comparison_rows:
+                            st.dataframe(pd.DataFrame(comparison_rows), use_container_width=True, hide_index=True)
             if result.get("saved"):
                 st.rerun()
         except (APIError, ValueError) as error:

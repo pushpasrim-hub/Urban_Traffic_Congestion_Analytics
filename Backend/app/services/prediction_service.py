@@ -1,5 +1,6 @@
 import os
 import tempfile
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -7,7 +8,7 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-from sqlalchemy import insert, select, func, or_
+from sqlalchemy import insert, select, or_
 from sqlalchemy.orm import Session
 
 from app.database import BACKEND_DIR
@@ -15,19 +16,18 @@ from app.models import get_table
 from app.schemas import PredictionRequest, to_database_datetime
 
 MINIMUM_TRAINING_ROWS = 30
-CONGESTION_LEVELS = {"low", "moderate", "high", "severe"}
 FEATURES = {
     "travel_time": {
-        "numeric": ["road_length_km", "speed_kmh", "vehicle_count", "hour", "day_of_week"],
-        "categorical": ["segment_id", "congestion_level"],
+        "numeric": ["road_length_km", "lag_speed_kmh", "lag_vehicle_count", "hour", "day_of_week"],
+        "categorical": ["segment_id", "lag_congestion_level"],
     },
     "traffic_volume": {
-        "numeric": ["road_length_km", "speed_kmh", "hour", "day_of_week"],
-        "categorical": ["segment_id", "congestion_level"],
+        "numeric": ["road_length_km", "lag_speed_kmh", "lag_vehicle_count", "hour", "day_of_week"],
+        "categorical": ["segment_id", "lag_congestion_level"],
     },
     "congestion": {
-        "numeric": ["road_length_km", "speed_kmh", "vehicle_count", "hour", "day_of_week"],
-        "categorical": ["segment_id"],
+        "numeric": ["road_length_km", "lag_speed_kmh", "lag_vehicle_count", "hour", "day_of_week"],
+        "categorical": ["segment_id", "lag_congestion_level"],
     },
 }
 
@@ -46,45 +46,162 @@ def model_path() -> Path:
 
 def _feature_frame(rows: list[dict[str, Any]], feature_set: dict[str, list[str]]) -> pd.DataFrame:
     frame = pd.DataFrame.from_records(rows)
-    recorded_at = pd.to_datetime(frame["recorded_at"], errors="coerce")
-    frame["hour"] = recorded_at.dt.hour
-    frame["day_of_week"] = recorded_at.dt.dayofweek
+    if "recorded_at" in frame:
+        recorded_at = pd.to_datetime(frame["recorded_at"], errors="coerce")
+        frame["hour"] = recorded_at.dt.hour
+        frame["day_of_week"] = recorded_at.dt.dayofweek
     frame["segment_id"] = frame["segment_id"].astype(str)
-    frame["congestion_level"] = frame["congestion_level"].fillna("unknown").astype(str)
+    if "lag_congestion_level" in frame:
+        frame["lag_congestion_level"] = frame["lag_congestion_level"].astype(object).where(
+            frame["lag_congestion_level"].notna(), np.nan
+        )
+        frame["lag_congestion_level"] = frame["lag_congestion_level"].map(
+            lambda value: str(value).strip().lower()
+            if pd.notna(value) and str(value).strip()
+            else np.nan
+        )
     for name in feature_set["numeric"]:
+        if name not in frame:
+            frame[name] = np.nan
         frame[name] = pd.to_numeric(frame[name], errors="coerce")
+        frame.loc[(frame[name] < 0) | ~np.isfinite(frame[name]), name] = np.nan
     return frame[feature_set["numeric"] + feature_set["categorical"]]
 
 
 def _training_frame(db: Session) -> pd.DataFrame:
     readings = get_table("traffic_readings")
     roads = get_table("road_segments")
-    required = {"segment_id", "recorded_at", "speed_kmh", "vehicle_count", "travel_time_minutes", "congestion_level"}
+    required = {"segment_id", "recorded_at"}
     missing = required.difference(readings.c.keys())
     if missing:
-        raise ValueError(f"traffic_readings is missing model columns: {', '.join(sorted(missing))}.")
+        raise ValueError(f"traffic_readings is missing required model columns: {', '.join(sorted(missing))}.")
     if "segment_id" not in roads.c:
         raise ValueError("road_segments is missing segment_id.")
 
-    selected = [
-        readings.c.segment_id,
-        readings.c.recorded_at,
-        readings.c.speed_kmh,
-        readings.c.vehicle_count,
-        readings.c.congestion_level,
-        readings.c.travel_time_minutes,
-    ]
+    selected = [readings.c.segment_id, readings.c.recorded_at]
+    for name in ("reading_id", "speed_kmh", "vehicle_count", "congestion_level", "travel_time_minutes"):
+        if name in readings.c:
+            selected.append(readings.c[name])
     if "length_km" in roads.c:
         selected.append(roads.c.length_km.label("road_length_km"))
     statement = select(*selected).select_from(
         readings.join(roads, readings.c.segment_id == roads.c.segment_id)
-    ).order_by(readings.c.recorded_at.asc())
-    frame = pd.DataFrame.from_records(db.execute(statement).mappings().all())
+    ).order_by(readings.c.recorded_at.asc(), readings.c.segment_id.asc())
+    selected_rows = db.execute(statement).mappings().all()
+    frame = pd.DataFrame.from_records(selected_rows, columns=[column.key for column in selected])
+    schema = {
+        table.name: {column.name: str(column.type) for column in table.columns}
+        for table in (readings, roads)
+    }
+    diagnostics: dict[str, Any] = {
+        "loaded_rows": int(len(frame)),
+        "duplicate_rows_removed": 0,
+        "invalid_timestamps_removed": 0,
+        "missing_segment_ids_removed": 0,
+        "negative_measurements_replaced_with_missing": 0,
+        "invalid_numeric_values_by_column": {},
+        "schema": schema,
+    }
     if "road_length_km" not in frame:
         frame["road_length_km"] = np.nan
+    for name in ("speed_kmh", "vehicle_count", "travel_time_minutes", "road_length_km"):
+        if name not in frame:
+            frame[name] = np.nan
+        source_values = frame[name]
+        values = pd.to_numeric(frame[name], errors="coerce")
+        diagnostics["invalid_numeric_values_by_column"][name] = int(
+            (source_values.notna() & (values.isna() | ~np.isfinite(values))).sum()
+        )
+        diagnostics["negative_measurements_replaced_with_missing"] += int((values < 0).sum())
+        frame[name] = values.mask((values < 0) | ~np.isfinite(values))
+    if "congestion_level" not in frame:
+        frame["congestion_level"] = None
+    frame["congestion_level"] = frame["congestion_level"].map(
+        lambda value: str(value).strip().lower() if pd.notna(value) and str(value).strip() else None
+    )
     frame["recorded_at"] = pd.to_datetime(frame["recorded_at"], errors="coerce")
-    frame["travel_time_minutes"] = pd.to_numeric(frame["travel_time_minutes"], errors="coerce")
-    return frame.dropna(subset=["recorded_at", "travel_time_minutes"])
+    diagnostics["invalid_timestamps_removed"] = int(frame["recorded_at"].isna().sum())
+    diagnostics["missing_segment_ids_removed"] = int(frame["segment_id"].isna().sum())
+    frame = frame.dropna(subset=["recorded_at", "segment_id"])
+    duplicate_subset = [name for name in frame.columns if name != "reading_id"]
+    frame = frame.drop_duplicates(subset=duplicate_subset, keep="first").copy()
+    diagnostics["duplicate_rows_removed"] = (
+        diagnostics["loaded_rows"]
+        - diagnostics["invalid_timestamps_removed"]
+        - diagnostics["missing_segment_ids_removed"]
+        - int(len(frame))
+    )
+    frame = frame.sort_values(["recorded_at", "segment_id"], kind="stable").reset_index(drop=True)
+    frame["segment_id"] = frame["segment_id"].astype(str)
+    frame["hour"] = frame["recorded_at"].dt.hour
+    frame["day_of_week"] = frame["recorded_at"].dt.dayofweek
+
+    frame["lag_speed_kmh"] = np.nan
+    frame["lag_vehicle_count"] = np.nan
+    frame["lag_congestion_level"] = None
+    for _, group in frame.groupby("segment_id", sort=False):
+        speed_history: deque[float] = deque(maxlen=10)
+        volume_history: deque[float] = deque(maxlen=10)
+        label_history: deque[str] = deque(maxlen=10)
+        for _, same_time in group.groupby("recorded_at", sort=True):
+            indices = same_time.index
+            frame.loc[indices, "lag_speed_kmh"] = (
+                float(np.mean(speed_history)) if speed_history else np.nan
+            )
+            frame.loc[indices, "lag_vehicle_count"] = (
+                float(np.mean(volume_history)) if volume_history else np.nan
+            )
+            frame.loc[indices, "lag_congestion_level"] = (
+                pd.Series(list(label_history), dtype="object").mode().iloc[0]
+                if label_history
+                else None
+            )
+            for row in same_time.itertuples(index=False):
+                speed = getattr(row, "speed_kmh")
+                volume = getattr(row, "vehicle_count")
+                label = getattr(row, "congestion_level")
+                if pd.notna(speed):
+                    speed_history.append(float(speed))
+                if pd.notna(volume):
+                    volume_history.append(float(volume))
+                if label:
+                    label_history.append(str(label))
+    diagnostics["missing_values_by_column"] = {
+        name: int(frame[name].isna().sum())
+        for name in (
+            "recorded_at",
+            "segment_id",
+            "road_length_km",
+            "speed_kmh",
+            "vehicle_count",
+            "travel_time_minutes",
+            "congestion_level",
+            "lag_speed_kmh",
+            "lag_vehicle_count",
+            "lag_congestion_level",
+        )
+    }
+    diagnostics["eligible_rows_by_target"] = {
+        "travel_time": int(
+            (
+                pd.to_numeric(frame["travel_time_minutes"], errors="coerce").ge(0)
+                & np.isfinite(pd.to_numeric(frame["travel_time_minutes"], errors="coerce"))
+            ).sum()
+        ),
+        "traffic_volume": int(
+            (
+                pd.to_numeric(frame["vehicle_count"], errors="coerce").ge(0)
+                & np.isfinite(pd.to_numeric(frame["vehicle_count"], errors="coerce"))
+            ).sum()
+        ),
+        "congestion": int(frame["congestion_level"].notna().sum()),
+    }
+    diagnostics["congestion_label_counts"] = {
+        str(label): int(count)
+        for label, count in frame["congestion_level"].value_counts().items()
+    }
+    frame.attrs["preprocessing"] = diagnostics
+    return frame
 
 
 def _pipeline(feature_set: dict[str, list[str]], classification: bool = False) -> Any:
@@ -99,11 +216,11 @@ def _pipeline(feature_set: dict[str, list[str]], classification: bool = False) -
 
     preprocessing = ColumnTransformer(
         transformers=[
-            ("numeric", SimpleImputer(strategy="median"), feature_set["numeric"]),
+            ("numeric", SimpleImputer(strategy="median", keep_empty_features=True), feature_set["numeric"]),
             (
                 "categorical",
                 Pipeline([
-                    ("imputer", SimpleImputer(strategy="most_frequent")),
+                    ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
                     ("onehot", OneHotEncoder(handle_unknown="ignore")),
                 ]),
                 feature_set["categorical"],
@@ -137,35 +254,44 @@ def train_model(db: Session) -> dict[str, Any]:
     if split_at < 2 or len(frame) - split_at < 2:
         raise InsufficientTrainingData("Not enough chronological training and validation rows. Add more historical readings.")
     try:
-        from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, mean_squared_error, r2_score
+        from sklearn.dummy import DummyClassifier, DummyRegressor
+        from sklearn.metrics import (
+            accuracy_score,
+            confusion_matrix,
+            f1_score,
+            mean_absolute_error,
+            mean_squared_error,
+            precision_score,
+            r2_score,
+            recall_score,
+        )
     except ImportError as exc:
         raise RuntimeError("scikit-learn is installed but its compiled dependencies cannot load in this environment.") from exc
 
-    rows = frame.to_dict(orient="records")
     models: dict[str, Any] = {}
     model_info: dict[str, Any] = {}
 
-    for name, target_column, unit in (
-        ("travel_time", "travel_time_minutes", "minutes"),
-        ("traffic_volume", "vehicle_count", "vehicles per reading"),
+    for name, target_column, unit, available_column in (
+        ("travel_time", "travel_time_minutes", "minutes", "travel_time_minutes"),
+        ("traffic_volume", "vehicle_count", "vehicles per reading", "vehicle_count"),
     ):
-        eligible = frame[target_column].notna()
+        target_values = pd.to_numeric(frame[target_column], errors="coerce")
+        eligible = target_values.ge(0) & np.isfinite(target_values)
         task_frame = frame.loc[eligible].reset_index(drop=True)
         if len(task_frame) < MINIMUM_TRAINING_ROWS:
             model_info[name] = {
                 "available": False,
                 "target": target_column,
                 "eligible_rows": int(len(task_frame)),
-                "detail": f"At least {MINIMUM_TRAINING_ROWS} valid rows are required; found {len(task_frame)}.",
+                "detail": (
+                    f"The traffic_readings table has no {available_column} column."
+                    if available_column not in frame.attrs.get("preprocessing", {}).get("schema", {}).get("traffic_readings", {})
+                    else f"At least {MINIMUM_TRAINING_ROWS} valid rows are required; found {len(task_frame)}."
+                ),
             }
             continue
-        task_split = int(len(task_frame) * 0.8)
         task_features = _feature_frame(task_frame.to_dict(orient="records"), FEATURES[name])
-        target = pd.to_numeric(task_frame[target_column], errors="coerce")
-        valid_target = target.notna()
-        task_frame = task_frame.loc[valid_target].reset_index(drop=True)
-        task_features = task_features.loc[valid_target].reset_index(drop=True)
-        target = target.loc[valid_target].reset_index(drop=True).astype(float)
+        target = pd.to_numeric(task_frame[target_column], errors="coerce").reset_index(drop=True).astype(float)
         task_split = int(len(task_frame) * 0.8)
         if len(task_frame) < MINIMUM_TRAINING_ROWS or task_split < 2 or len(task_frame) - task_split < 2:
             model_info[name] = {"available": False, "target": target_column, "eligible_rows": int(len(task_frame)), "detail": "Not enough chronological training and validation rows."}
@@ -174,12 +300,18 @@ def train_model(db: Session) -> dict[str, Any]:
         pipeline.fit(task_features.iloc[:task_split], target.iloc[:task_split])
         predicted = pipeline.predict(task_features.iloc[task_split:])
         actual = target.iloc[task_split:].to_numpy()
+        baseline = DummyRegressor(strategy="mean")
+        baseline.fit(task_features.iloc[:task_split], target.iloc[:task_split])
+        baseline_predicted = baseline.predict(task_features.iloc[task_split:])
         metrics: dict[str, float] = {
             "mae": float(mean_absolute_error(actual, predicted)),
             "rmse": float(np.sqrt(mean_squared_error(actual, predicted))),
         }
+        metrics["baseline_mae"] = float(mean_absolute_error(actual, baseline_predicted))
+        metrics["baseline_rmse"] = float(np.sqrt(mean_squared_error(actual, baseline_predicted)))
         if len(actual) >= 2 and np.unique(actual).size > 1:
             metrics["r2"] = float(r2_score(actual, predicted))
+            metrics["baseline_r2"] = float(r2_score(actual, baseline_predicted))
         pipeline.fit(task_features, target)
         models[name] = pipeline
         model_info[name] = {
@@ -190,49 +322,68 @@ def train_model(db: Session) -> dict[str, Any]:
             "training_rows": int(task_split),
             "validation_rows": int(len(task_frame) - task_split),
             "metrics": metrics,
+            "baseline": {"name": "DummyRegressor(mean)", "metrics": {
+                "mae": metrics["baseline_mae"],
+                "rmse": metrics["baseline_rmse"],
+                **({"r2": metrics["baseline_r2"]} if "baseline_r2" in metrics else {}),
+            }},
         }
 
-    class_counts = frame["congestion_level"].dropna().astype(str).value_counts()
-    congestion_detail = ""
     classifier_frame = frame.loc[frame["congestion_level"].notna()].reset_index(drop=True)
+    class_target = classifier_frame["congestion_level"].astype(str).reset_index(drop=True)
+    class_counts = class_target.value_counts()
+    congestion_detail = ""
     if len(classifier_frame) < MINIMUM_TRAINING_ROWS:
         congestion_detail = f"At least {MINIMUM_TRAINING_ROWS} classified readings are required; found {len(classifier_frame)}."
-    elif len(class_counts) < 2 or class_counts.min() < 2:
-        congestion_detail = "At least two congestion levels with multiple historical examples are required."
+    elif len(class_counts) < 2:
+        congestion_detail = "At least two distinct congestion labels are required in the historical readings."
     else:
         class_split = int(len(classifier_frame) * 0.8)
         class_features = _feature_frame(classifier_frame.to_dict(orient="records"), FEATURES["congestion"])
-        class_target = classifier_frame["congestion_level"].astype(str)
-        train_classes = set(class_target.iloc[:class_split])
-        validation_classes = set(class_target.iloc[class_split:])
-        if len(train_classes) < 2 or len(validation_classes) < 2:
-            congestion_detail = "The chronological training and validation windows must each contain at least two congestion levels."
-        elif not validation_classes.issubset(train_classes):
-            congestion_detail = "The validation window contains a congestion level absent from training; add more examples for each level."
-        else:
-            try:
-                classifier = _pipeline(FEATURES["congestion"], classification=True)
-                classifier.fit(class_features.iloc[:class_split], class_target.iloc[:class_split])
-                predicted_classes = classifier.predict(class_features.iloc[class_split:])
-                actual_classes = class_target.iloc[class_split:]
-                class_metrics = {
-                    "accuracy": float(accuracy_score(actual_classes, predicted_classes)),
-                    "f1_weighted": float(f1_score(actual_classes, predicted_classes, average="weighted", zero_division=0)),
-                }
-                classifier.fit(class_features, class_target)
-                models["congestion"] = classifier
-                model_info["congestion"] = {
-                    "available": True,
-                    "target": "congestion_level",
-                    "unit": "classification",
-                    "classes": sorted(train_classes),
-                    "feature_names": FEATURES["congestion"]["numeric"] + FEATURES["congestion"]["categorical"],
-                    "training_rows": int(class_split),
-                    "validation_rows": int(len(classifier_frame) - class_split),
-                    "metrics": class_metrics,
-                }
-            except ImportError as exc:
-                raise RuntimeError("scikit-learn is installed but its compiled dependencies cannot load in this environment.") from exc
+        train_classes = sorted(set(class_target.iloc[:class_split]))
+        validation_classes = sorted(set(class_target.iloc[class_split:]))
+        classifier = _pipeline(FEATURES["congestion"], classification=True)
+        classifier.fit(class_features.iloc[:class_split], class_target.iloc[:class_split])
+        predicted_classes = classifier.predict(class_features.iloc[class_split:])
+        actual_classes = class_target.iloc[class_split:]
+        evaluation_labels = sorted(set(actual_classes) | set(predicted_classes) | set(train_classes))
+        class_metrics = {
+            "accuracy": float(accuracy_score(actual_classes, predicted_classes)),
+            "precision_weighted": float(precision_score(actual_classes, predicted_classes, labels=evaluation_labels, average="weighted", zero_division=0)),
+            "recall_weighted": float(recall_score(actual_classes, predicted_classes, labels=evaluation_labels, average="weighted", zero_division=0)),
+            "f1_weighted": float(f1_score(actual_classes, predicted_classes, labels=evaluation_labels, average="weighted", zero_division=0)),
+            "confusion_matrix": confusion_matrix(actual_classes, predicted_classes, labels=evaluation_labels).tolist(),
+            "confusion_matrix_labels": evaluation_labels,
+        }
+        baseline = DummyClassifier(strategy="most_frequent")
+        baseline.fit(class_features.iloc[:class_split], class_target.iloc[:class_split])
+        baseline_predicted = baseline.predict(class_features.iloc[class_split:])
+        class_metrics["baseline_accuracy"] = float(accuracy_score(actual_classes, baseline_predicted))
+        class_metrics["baseline_precision_weighted"] = float(precision_score(actual_classes, baseline_predicted, labels=evaluation_labels, average="weighted", zero_division=0))
+        class_metrics["baseline_recall_weighted"] = float(recall_score(actual_classes, baseline_predicted, labels=evaluation_labels, average="weighted", zero_division=0))
+        class_metrics["baseline_f1_weighted"] = float(f1_score(actual_classes, baseline_predicted, labels=evaluation_labels, average="weighted", zero_division=0))
+        classifier.fit(class_features, class_target)
+        models["congestion"] = classifier
+        model_info["congestion"] = {
+            "available": True,
+            "target": "congestion_level",
+            "unit": "classification",
+            "classes": sorted(set(class_target)),
+            "feature_names": FEATURES["congestion"]["numeric"] + FEATURES["congestion"]["categorical"],
+            "training_rows": int(class_split),
+            "validation_rows": int(len(classifier_frame) - class_split),
+            "metrics": class_metrics,
+            "baseline": {
+                "name": "DummyClassifier(most_frequent)",
+                "metrics": {
+                    "accuracy": class_metrics["baseline_accuracy"],
+                    "precision_weighted": class_metrics["baseline_precision_weighted"],
+                    "recall_weighted": class_metrics["baseline_recall_weighted"],
+                    "f1_weighted": class_metrics["baseline_f1_weighted"],
+                },
+            },
+            "validation_labels_not_seen_in_training": sorted(set(validation_classes) - set(train_classes)),
+        }
     if "congestion" not in model_info:
         model_info["congestion"] = {
             "available": False,
@@ -252,6 +403,13 @@ def train_model(db: Session) -> dict[str, Any]:
         "total_rows": int(len(frame)),
         "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "weather_used": False,
+        "preprocessing": frame.attrs.get("preprocessing", {}),
+        "limitations": [
+            "Validation uses a chronological holdout; results depend on the historical period and data quality.",
+            "Lagged traffic inputs use up to ten earlier readings for the same road segment; no current-row target is used as a feature.",
+            "Weather is not a model feature because the existing schema has no defensible road-to-weather mapping.",
+            "Predictions are estimates from stored historical observations, not real-time sensor feeds.",
+        ],
     }
     travel_info = model_info.get("travel_time", {})
     metadata["metrics"] = travel_info.get("metrics", {})
@@ -271,50 +429,61 @@ def train_model(db: Session) -> dict[str, Any]:
 
 def model_status(db: Session) -> dict[str, Any]:
     path = model_path()
-    readings = get_table("traffic_readings")
-    required = {"travel_time_minutes", "vehicle_count", "congestion_level"}
-    missing = required.difference(readings.c.keys())
-    if missing:
-        raise ValueError(f"traffic_readings is missing model columns: {', '.join(sorted(missing))}.")
-    total_rows = int(db.scalar(select(func.count()).select_from(readings)) or 0)
+    frame = _training_frame(db)
+    schema = frame.attrs.get("preprocessing", {}).get("schema", {})
     rows_by_target = {
-        "travel_time": int(db.scalar(select(func.count(readings.c.travel_time_minutes))) or 0),
-        "traffic_volume": int(db.scalar(select(func.count(readings.c.vehicle_count))) or 0),
-        "congestion": int(db.scalar(select(func.count(readings.c.congestion_level))) or 0),
+        "travel_time": int(
+            (
+                pd.to_numeric(frame["travel_time_minutes"], errors="coerce").ge(0)
+                & np.isfinite(pd.to_numeric(frame["travel_time_minutes"], errors="coerce"))
+            ).sum()
+        ),
+        "traffic_volume": int(
+            (
+                pd.to_numeric(frame["vehicle_count"], errors="coerce").ge(0)
+                & np.isfinite(pd.to_numeric(frame["vehicle_count"], errors="coerce"))
+            ).sum()
+        ),
+        "congestion": int(frame["congestion_level"].notna().sum()),
     }
     readiness: dict[str, Any] = {}
     for name, rows in rows_by_target.items():
+        target_column = {
+            "travel_time": "travel_time_minutes",
+            "traffic_volume": "vehicle_count",
+            "congestion": "congestion_level",
+        }[name]
+        target_exists = target_column in schema.get("traffic_readings", {})
         readiness[name] = {
             "available": False,
             "eligible_rows": rows,
-            "detail": f"At least {MINIMUM_TRAINING_ROWS} valid historical rows are required; found {rows}.",
+            "detail": (
+                "The existing traffic_readings table does not contain this target column."
+                if not target_exists
+                else f"At least {MINIMUM_TRAINING_ROWS} valid historical rows are required; found {rows}."
+            ),
         }
-    levels = db.execute(
-        select(readings.c.congestion_level, func.count().label("class_count"))
-        .where(readings.c.congestion_level.is_not(None))
-        .group_by(readings.c.congestion_level)
-    ).all()
-    if rows_by_target["congestion"] >= MINIMUM_TRAINING_ROWS:
-        if len(levels) < 2 or min(int(row.class_count) for row in levels) < 2:
-            readiness["congestion"]["detail"] = "At least two congestion levels with multiple examples are required."
-        else:
-            readiness["congestion"]["detail"] = "Ready for chronological classification validation."
+    class_counts = frame["congestion_level"].dropna().value_counts()
+    if rows_by_target["congestion"] >= MINIMUM_TRAINING_ROWS and len(class_counts) < 2:
+        readiness["congestion"]["detail"] = "At least two distinct congestion labels are required in the historical readings."
+    elif rows_by_target["congestion"] >= MINIMUM_TRAINING_ROWS:
+        readiness["congestion"]["detail"] = "Ready for chronological classification validation."
     if not path.is_file():
         return {
             "available": False,
             "detail": "No trained model artifact is available.",
-            "total_rows": total_rows,
+            "total_rows": int(len(frame)),
             "minimum_training_rows": MINIMUM_TRAINING_ROWS,
             "eligible_rows": rows_by_target,
             "models": readiness,
         }
     try:
         artifact = joblib.load(path)
-    except (OSError, ValueError, EOFError, ImportError):
+    except (OSError, ValueError, EOFError, ImportError, AttributeError, KeyError, TypeError):
         return {
             "available": False,
             "detail": "The saved model could not be loaded. Retrain the model.",
-            "total_rows": total_rows,
+            "total_rows": int(len(frame)),
             "minimum_training_rows": MINIMUM_TRAINING_ROWS,
             "eligible_rows": rows_by_target,
             "models": readiness,
@@ -327,7 +496,7 @@ def model_status(db: Session) -> dict[str, Any]:
     return {
         "available": bool(fitted_models),
         "detail": "One or more trained models are available." if fitted_models else "No trained prediction models are available.",
-        "total_rows": total_rows,
+        "total_rows": int(len(frame)),
         "minimum_training_rows": MINIMUM_TRAINING_ROWS,
         "eligible_rows": rows_by_target,
         **metadata,
@@ -335,14 +504,26 @@ def model_status(db: Session) -> dict[str, Any]:
     }
 
 
-def predict_travel_time(db: Session, request: PredictionRequest) -> dict[str, Any]:
+def _load_artifact() -> dict[str, Any]:
     artifact_path = model_path()
     if not artifact_path.is_file():
         raise InsufficientTrainingData("No trained model is available. Train a model from historical readings first.")
     try:
         artifact = joblib.load(artifact_path)
-    except (OSError, ValueError, EOFError, ImportError) as exc:
+    except (OSError, ValueError, EOFError, ImportError, AttributeError, KeyError, TypeError) as exc:
         raise RuntimeError("The saved model could not be loaded. Retrain it after the model runtime is available.") from exc
+    if not isinstance(artifact, dict) or not isinstance(artifact.get("models"), dict):
+        raise RuntimeError("The saved model artifact has an unsupported format. Retrain the model.")
+    return artifact
+
+
+def predict_travel_time(
+    db: Session,
+    request: PredictionRequest,
+    *,
+    artifact: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    artifact = artifact or _load_artifact()
     models = artifact.get("models", {})
     roads = get_table("road_segments")
     if "segment_id" not in roads.c:
@@ -383,12 +564,11 @@ def predict_travel_time(db: Session, request: PredictionRequest) -> dict[str, An
     row = {
         "segment_id": request.segment_id,
         "road_length_km": road.get("length_km") if "length_km" in road else np.nan,
-        "speed_kmh": speed_value,
-        "vehicle_count": vehicles_value,
+        "lag_speed_kmh": speed_value,
+        "lag_vehicle_count": vehicles_value,
+        "lag_congestion_level": congestion_value,
         "hour": timestamp.hour,
         "day_of_week": timestamp.weekday(),
-        "congestion_level": congestion_value or "unknown",
-        "recorded_at": timestamp,
     }
     outputs: dict[str, Any] = {
         "predicted_travel_time_minutes": None,
@@ -409,8 +589,9 @@ def predict_travel_time(db: Session, request: PredictionRequest) -> dict[str, An
         model_features = _feature_frame([row], target_feature)
         predicted = pipeline.predict(model_features)[0]
         if name == "congestion":
-            if str(predicted) not in CONGESTION_LEVELS:
-                unavailable[name] = "The classifier returned an unsupported congestion class."
+            trained_classes = {str(label) for label in getattr(pipeline, "classes_", [])}
+            if str(predicted) not in trained_classes:
+                unavailable[name] = "The classifier returned a label outside the trained class set."
                 continue
             outputs[output_key] = str(predicted)
         else:
@@ -456,7 +637,10 @@ def predict_travel_time(db: Session, request: PredictionRequest) -> dict[str, An
             "prediction_hour": timestamp.hour,
             "prediction_day_of_week": timestamp.strftime("%A"),
             "historical_readings_used": len(recent),
-            "feature_names": artifact.get("metadata", {}).get("models", {}),
+            "feature_names": {
+                name: item.get("feature_names", [])
+                for name, item in artifact.get("metadata", {}).get("models", {}).items()
+            },
         },
         "unavailable_outputs": unavailable,
         "context": {
@@ -465,6 +649,79 @@ def predict_travel_time(db: Session, request: PredictionRequest) -> dict[str, An
             "weather_is_road_specific": False,
         },
         "model": artifact["metadata"],
+    }
+
+
+def what_if_scenarios(db: Session, request: PredictionRequest) -> dict[str, Any]:
+    artifact = _load_artifact()
+    baseline = predict_travel_time(db, request, artifact=artifact)
+    model_info = artifact.get("metadata", {}).get("models", {})
+    volume_features_used = any(
+        "lag_vehicle_count" in item.get("feature_names", [])
+        for item in model_info.values()
+        if item.get("available")
+    )
+    volume_value = baseline.get("model_inputs", {}).get("vehicle_count")
+    scenarios: list[dict[str, Any]] = []
+    if volume_features_used and volume_value is not None and np.isfinite(float(volume_value)):
+        increased_request = request.model_copy(
+            update={"vehicle_count": float(volume_value) * 1.2, "save": False}
+        )
+        increased = predict_travel_time(db, increased_request, artifact=artifact)
+        comparisons: dict[str, Any] = {}
+        for key in (
+            "predicted_travel_time_minutes",
+            "predicted_vehicle_count",
+            "predicted_congestion_level",
+        ):
+            base_value = baseline.get(key)
+            scenario_value = increased.get(key)
+            comparisons[key] = {
+                "baseline": base_value,
+                "scenario": scenario_value,
+                "difference": (
+                    float(scenario_value) - float(base_value)
+                    if isinstance(base_value, (int, float))
+                    and isinstance(scenario_value, (int, float))
+                    else None
+                ),
+            }
+        scenarios.append({
+            "name": "traffic_volume_increased_20_percent",
+            "supported": True,
+            "hypothetical": True,
+            "input_vehicle_count": float(volume_value) * 1.2,
+            "predictions": comparisons,
+        })
+    else:
+        scenarios.append({
+            "name": "traffic_volume_increased_20_percent",
+            "supported": False,
+            "hypothetical": True,
+            "detail": "The trained model does not use traffic volume as an input, or a valid baseline volume is unavailable.",
+        })
+
+    rainy_features_used = any(
+        any(token in feature.lower() for token in ("rain", "weather", "precipitation"))
+        for item in model_info.values()
+        for feature in item.get("feature_names", [])
+    )
+    scenarios.append({
+        "name": "rainy_weather",
+        "supported": False,
+        "hypothetical": True,
+        "detail": (
+            "The artifact lists a weather feature, but no road-specific rainy-weather value can be supplied safely."
+            if rainy_features_used
+            else "Weather is not used by the trained model; weather_data has no road-segment mapping in the existing schema."
+        ),
+    })
+    return {
+        "hypothetical": True,
+        "interpretation": "These are model-based hypothetical comparisons, not proven causal effects.",
+        "baseline": baseline,
+        "scenarios": scenarios,
+        "model": artifact.get("metadata", {}),
     }
 
 

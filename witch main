@@ -1,0 +1,162 @@
+[1mdiff --git a/Backend/app/routers/ml.py b/Backend/app/routers/ml.py[m
+[1mindex 5f696cc..6d69985 100644[m
+[1m--- a/Backend/app/routers/ml.py[m
+[1m+++ b/Backend/app/routers/ml.py[m
+[36m@@ -3,7 +3,7 @@[m [mfrom sqlalchemy.exc import SQLAlchemyError[m
+ from sqlalchemy.orm import Session[m
+ [m
+ from app.database import get_db[m
+[31m-from app.schemas import PredictionRequest[m
+[32m+[m[32mfrom app.schemas import PredictionRequest, WhatIfRequest[m
+ from app.security import get_current_user[m
+ from app.services.prediction_service import ([m
+     InsufficientTrainingData,[m
+[36m@@ -11,6 +11,7 @@[m [mfrom app.services.prediction_service import ([m
+     predict_travel_time,[m
+     save_prediction,[m
+     train_model,[m
+[32m+[m[32m    what_if_scenarios,[m
+ )[m
+ [m
+ router = APIRouter(prefix="/ml", tags=["Machine learning"])[m
+[36m@@ -76,4 +77,26 @@[m [mdef predict([m
+         "saved_fields": saved_fields,[m
+         "unsupported_persistence_fields": unsupported_fields,[m
+         "prediction": saved_record,[m
+[31m-    }[m
+\ No newline at end of file[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m
+[32m+[m[32m@router.post("/what-if")[m
+[32m+[m[32mdef what_if([m
+[32m+[m[32m    request: WhatIfRequest,[m
+[32m+[m[32m    _user: dict = Depends(get_current_user),[m
+[32m+[m[32m    db: Session = Depends(get_db),[m
+[32m+[m[32m) -> dict:[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        return what_if_scenarios(db, request)[m
+[32m+[m[32m    except InsufficientTrainingData as exc:[m
+[32m+[m[32m        raise HTTPException(status_code=409, detail=str(exc)) from None[m
+[32m+[m[32m    except LookupError as exc:[m
+[32m+[m[32m        raise HTTPException(status_code=404, detail=str(exc)) from None[m
+[32m+[m[32m    except ValueError as exc:[m
+[32m+[m[32m        db.rollback()[m
+[32m+[m[32m        raise HTTPException(status_code=422, detail=str(exc)) from None[m
+[32m+[m[32m    except RuntimeError as exc:[m
+[32m+[m[32m        raise HTTPException(status_code=503, detail=str(exc)) from None[m
+[32m+[m[32m    except SQLAlchemyError:[m
+[32m+[m[32m        db.rollback()[m
+[32m+[m[32m        raise HTTPException(status_code=503, detail="Scenario inputs could not be loaded from the existing database.") from None[m
+\ No newline at end of file[m
+[1mdiff --git a/Backend/app/schemas.py b/Backend/app/schemas.py[m
+[1mindex f80f7cd..d4e8ab4 100644[m
+[1m--- a/Backend/app/schemas.py[m
+[1m+++ b/Backend/app/schemas.py[m
+[36m@@ -124,8 +124,8 @@[m [mclass LoginRequest(InputModel):[m
+ class PredictionRequest(InputModel):[m
+     segment_id: int = Field(gt=0)[m
+     predicted_for: datetime[m
+[31m-    speed_kmh: float | None = Field(default=None, ge=0)[m
+[31m-    vehicle_count: float | None = Field(default=None, ge=0)[m
+[32m+[m[32m    speed_kmh: float | None = Field(default=None, ge=0, allow_inf_nan=False)[m
+[32m+[m[32m    vehicle_count: float | None = Field(default=None, ge=0, allow_inf_nan=False)[m
+     current_congestion_level: CongestionLevel | None = None[m
+     save: bool = True[m
+ [m
+[36m@@ -135,6 +135,10 @@[m [mclass PredictionRequest(InputModel):[m
+         return to_database_datetime(value)[m
+ [m
+ [m
+[32m+[m[32mclass WhatIfRequest(PredictionRequest):[m
+[32m+[m[32m    save: Literal[False] = False[m
+[32m+[m
+[32m+[m
+ def to_database_datetime(value: datetime) -> datetime:[m
+     if value.tzinfo is not None:[m
+         return value.astimezone(timezone.utc).replace(tzinfo=None)[m
+[1mdiff --git a/Backend/app/services/prediction_service.py b/Backend/app/services/prediction_service.py[m
+[1mindex 0a99e49..ef0ce19 100644[m
+[1m--- a/Backend/app/services/prediction_service.py[m
+[1m+++ b/Backend/app/services/prediction_service.py[m
+[36m@@ -1,5 +1,6 @@[m
+ import os[m
+ import tempfile[m
+[32m+[m[32mfrom collections import deque[m
+ from datetime import datetime, timezone[m
+ from pathlib import Path[m
+ from typing import Any[m
+[36m@@ -7,7 +8,7 @@[m [mfrom typing import Any[m
+ import joblib[m
+ import numpy as np[m
+ import pandas as pd[m
+[31m-from sqlalchemy import insert, select, func, or_[m
+[32m+[m[32mfrom sqlalchemy import insert, select, or_[m
+ from sqlalchemy.orm import Session[m
+ [m
+ from app.database import BACKEND_DIR[m
+[36m@@ -15,19 +16,18 @@[m [mfrom app.models import get_table[m
+ from app.schemas import PredictionRequest, to_database_datetime[m
+ [m
+ MINIMUM_TRAINING_ROWS = 30[m
+[31m-CONGESTION_LEVELS = {"low", "moderate", "high", "severe"}[m
+ FEATURES = {[m
+     "travel_time": {[m
+[31m-        "numeric": ["road_length_km", "speed_kmh", "vehicle_count", "hour", "day_of_week"],[m
+[31m-        "categorical": ["segment_id", "congestion_level"],[m
+[32m+[m[32m        "numeric": ["road_length_km", "lag_speed_kmh", "lag_vehicle_count", "hour", "day_of_week"],[m
+[32m+[m[32m        "categorical": ["segment_id", "lag_congestion_level"],[m
+     },[m
+     "traffic_volume": {[m
+[31m-        "numeric": ["road_length_km", "speed_kmh", "hour", "day_of_week"],[m
+[31m-        "categorical": ["segment_id", "congestion_level"],[m
+[32m+[m[32m        "numeric": ["road_length_km", "lag_speed_kmh", "lag_vehicle_count", "hour", "day_of_week"],[m
+[32m+[m[32m        "categorical": ["segment_id", "lag_congestion_level"],[m
+     },[m
+     "congestion": {[m
+[31m-        "numeric": ["road_length_km", "speed_kmh", "vehicle_count", "hour", "day_of_week"],[m
+[31m-        "categorical": ["segment_id"],[m
+[32m+[m[32m        "numeric": ["road_length_km", "lag_speed_kmh", "lag_vehicle_count", "hour", "day_of_week"],[m
+[32m+[m[32m        "categorical": ["segment_id", "lag_congestion_level"],[m
+     },[m
+ }[m
+ [m
+[36m@@ -46,45 +46,162 @@[m [mdef model_path() -> Path:[m
+ [m
+ def _feature_frame(rows: list[dict[str, Any]], feature_set: dict[str, list[str]]) -> pd.DataFrame:[m
+     frame = pd.DataFrame.from_records(rows)[m
+[31m-    recorded_at = pd.to_datetime(frame["recorded_at"], errors="coerce")[m
+[31m-    frame["hour"] = recorded_at.dt.hour[m
+[31m-    frame["day_of_week"] = recorded_at.dt.dayofweek[m
+[32m+[m[32m    if "recorded_at" in frame:[m
+[32m+[m[32m        recorded_at = pd.to_datetime(frame["recorded_at"], errors="coerce")[m
+[32m+[m[32m        frame["hour"] = recorded_at.dt.hour[m
+[32m+[m[32m        frame["day_of_week"] = recorded_at.dt.dayofweek[m
+     frame["segment_id"] = frame["segment_id"].astype(str)[m
+[31m-    frame["congestion_level"] = frame["congestion_level"].fillna("unknown").astype(str)[m
+[32m+[m[32m    if "lag_congestion_level" in frame:[m
+[32m+[m[32m        frame["lag_congestion_level"] = frame["lag_congestion_level"].astype(object).where([m
+[32m+[m[32m            frame["lag_congestion_level"].notna(), np.nan[m
+[32m+[m[32m        )[m
+[32m+[m[32m        frame["lag_congestion_level"] = frame["lag_congestion_level"].map([m
+[32m+[m[32m            lambda value: str(value).strip().lower()[m
+[32m+[m[32m            if pd.notna(value) and str(value).strip()[m
+[32m+[m[32m            else np.nan[m
+[32m+[m[32m        )[m
+     for name in feature_set["numeric"]:[m
+[32m+[m[32m        if name not in frame:[m
+[32m+[m[32m            frame[name] = np.nan[m
+         frame[name] = pd.to_numeric(frame[name], errors="coerce")[m
+[32m+[m[32m        frame.loc[(frame[name] < 0) | ~np.isfinite(frame[name]), name] = np.nan[m
+     return frame[feature_set["numeric"] + feature_set["categorical"]][m
+ [m
+ [m
+ def _training_frame(db: Session) -> pd.DataFrame:[m
+     readings = get_table("traffic_readings")[m
+     roads = get_table("road_segments")[m
+[31m-    required = {"segment_id", "recorded_at", "speed_kmh", "vehicle_count", "travel_time_minutes", "congestion_level"}[m
+[32m+[m[32m    required = {"segment_id", "recorded_at"}[m
+     missing = required.difference(readings.c.keys())[m
+     if missing:[m
+[31m-        raise ValueError(f"traffic_readings is missing model columns: {', '.join(sorted(missing))}.")[m
+[32m+[m[32m        raise ValueError(f"traffic_readings is missing required model columns

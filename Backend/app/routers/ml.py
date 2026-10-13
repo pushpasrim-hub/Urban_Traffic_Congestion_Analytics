@@ -3,7 +3,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.schemas import PredictionRequest
+from app.schemas import PredictionRequest, WhatIfRequest
 from app.security import get_current_user
 from app.services.prediction_service import (
     InsufficientTrainingData,
@@ -11,6 +11,7 @@ from app.services.prediction_service import (
     predict_travel_time,
     save_prediction,
     train_model,
+    what_if_scenarios,
 )
 
 router = APIRouter(prefix="/ml", tags=["Machine learning"])
@@ -77,3 +78,25 @@ def predict(
         "unsupported_persistence_fields": unsupported_fields,
         "prediction": saved_record,
     }
+
+
+@router.post("/what-if")
+def what_if(
+    request: WhatIfRequest,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return what_if_scenarios(db, request)
+    except InsufficientTrainingData as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Scenario inputs could not be loaded from the existing database.") from None

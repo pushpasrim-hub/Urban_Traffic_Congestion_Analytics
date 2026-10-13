@@ -10,3 +10,5 @@ scikit-learn>=1.5,<2.0
 joblib>=1.4,<2.0
 PyJWT>=2.9,<3.0
 pwdlib[argon2]>=0.2,<1.0
+pytest>=8.0,<9.0
+httpx2>=2.0,<3.0
