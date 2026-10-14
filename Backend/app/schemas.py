@@ -121,6 +121,10 @@ class LoginRequest(InputModel):
     password: str = Field(min_length=1, max_length=1024)
 
 
+class BrowserSessionTicketRequest(InputModel):
+    ticket: str = Field(min_length=32, max_length=128)
+
+
 class PredictionRequest(InputModel):
     segment_id: int = Field(gt=0)
     predicted_for: datetime
@@ -150,7 +154,7 @@ class TrafficScenarioRequest(InputModel):
     @classmethod
     def normalize_predicted_for(cls, value: datetime) -> datetime:
         return to_database_datetime(value)
-
+WhatIfRequest = TrafficScenarioRequest
 
 def to_database_datetime(value: datetime) -> datetime:
     if value.tzinfo is not None:

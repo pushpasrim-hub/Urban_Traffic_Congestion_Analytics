@@ -12,7 +12,7 @@ class APIError(Exception):
 
 class APIClient:
     def __init__(self, base_url: str | None = None, timeout: int = 10):
-        self.base_url = (base_url or os.getenv("API_BASE_URL", "http://127.0.0.1:8000/api")).rstrip("/")
+        self.base_url = (base_url or os.getenv("API_BASE_URL", "http://localhost:8001/api")).rstrip("/")
         self.timeout = timeout
         self.token: str | None = None
 
@@ -20,7 +20,10 @@ class APIClient:
         self.token = token
 
     def request(self, method: str, path: str, **kwargs: Any) -> Any:
-        headers = dict(kwargs.pop("headers", {}))
+        headers = dict(kwargs.pop("headers", None) or {})
+        timeout = kwargs.pop("timeout", None)
+        if timeout is None:
+            timeout = self.timeout
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         try:
@@ -28,7 +31,7 @@ class APIClient:
                 method,
                 f"{self.base_url}/{path.lstrip('/')}",
                 headers=headers,
-                timeout=self.timeout,
+                timeout=timeout,
                 **kwargs,
             )
         except requests.Timeout:
@@ -62,8 +65,21 @@ class APIClient:
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return self.request("GET", path, params=params)
 
-    def post(self, path: str, payload: dict[str, Any] | None = None) -> Any:
-        return self.request("POST", path, json=payload)
+    def post(
+        self,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: int | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        return self.request(
+            "POST",
+            path,
+            json=payload,
+            timeout=timeout,
+            headers=headers,
+        )
 
     def put(self, path: str, payload: dict[str, Any]) -> Any:
         return self.request("PUT", path, json=payload)

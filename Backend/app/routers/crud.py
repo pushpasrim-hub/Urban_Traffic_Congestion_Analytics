@@ -94,6 +94,8 @@ def register_crud_routes(
     primary_key: str,
     create_schema: type[BaseModel],
     patch_schema: type[BaseModel],
+    *,
+    read_only: bool = False,
 ) -> None:
     def list_records(
         segment_id: int | None = None,
@@ -135,7 +137,11 @@ def register_crud_routes(
                 or_(table.c.end_time.is_(None), table.c.end_time >= now)
             )
         if search:
-            string_columns = [column for column in table.c if str(column.type).upper().startswith(("VARCHAR", "CHAR", "TEXT"))]
+            string_columns = [
+                column
+                for column in table.c
+                if str(column.type).upper().startswith(("VARCHAR", "CHAR", "TEXT", "ENUM"))
+            ]
             if string_columns:
                 statement = statement.where(or_(*(column.ilike(f"%{search}%") for column in string_columns)))
         order_column = _time_column(table, ("recorded_at", "predicted_for", "start_time", "created_at"))
@@ -249,8 +255,9 @@ def register_crud_routes(
         return {"detail": "Record deleted."}
 
     router.add_api_route(path, list_records, methods=["GET"], response_model=list[dict], name=f"list_{table_name}")
-    router.add_api_route(path, create_record, methods=["POST"], response_model=dict, status_code=status.HTTP_201_CREATED, name=f"create_{table_name}")
     router.add_api_route(f"{path}/{{{primary_key}}}", get_record, methods=["GET"], response_model=dict, name=f"get_{table_name}")
-    router.add_api_route(f"{path}/{{{primary_key}}}", replace_record, methods=["PUT"], response_model=dict, name=f"replace_{table_name}")
-    router.add_api_route(f"{path}/{{{primary_key}}}", patch_record, methods=["PATCH"], response_model=dict, name=f"patch_{table_name}")
-    router.add_api_route(f"{path}/{{{primary_key}}}", delete_record, methods=["DELETE"], response_model=dict, name=f"delete_{table_name}")
+    if not read_only:
+        router.add_api_route(path, create_record, methods=["POST"], response_model=dict, status_code=status.HTTP_201_CREATED, name=f"create_{table_name}")
+        router.add_api_route(f"{path}/{{{primary_key}}}", replace_record, methods=["PUT"], response_model=dict, name=f"replace_{table_name}")
+        router.add_api_route(f"{path}/{{{primary_key}}}", patch_record, methods=["PATCH"], response_model=dict, name=f"patch_{table_name}")
+        router.add_api_route(f"{path}/{{{primary_key}}}", delete_record, methods=["DELETE"], response_model=dict, name=f"delete_{table_name}")

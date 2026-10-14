@@ -5,4 +5,4 @@ start "Urban Traffic Backend" powershell -NoExit -Command "Set-Location -Literal
 
 timeout /t 3 /nobreak >nul
 
-start "Urban Traffic Frontend" powershell -NoExit -Command "$env:API_BASE_URL='http://127.0.0.1:8001/api'; Set-Location -LiteralPath '%PROJECT%Frontend'; & '.\.venv\Scripts\python.exe' -m streamlit run app.py"
+start "Urban Traffic Frontend" powershell -NoExit -Command "$env:API_BASE_URL='http://localhost:8001/api'; Set-Location -LiteralPath '%PROJECT%Frontend'; & '.\.venv\Scripts\python.exe' -m streamlit run app.py"

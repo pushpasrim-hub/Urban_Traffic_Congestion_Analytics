@@ -8,7 +8,7 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-from sqlalchemy import insert, select, or_
+from sqlalchemy import case, func, insert, literal, or_, select
 from sqlalchemy.orm import Session
 
 from app.database import BACKEND_DIR
@@ -46,6 +46,7 @@ def model_path() -> Path:
 
 def _feature_frame(rows: list[dict[str, Any]], feature_set: dict[str, list[str]]) -> pd.DataFrame:
     frame = pd.DataFrame.from_records(rows)
+    frame.columns = frame.columns.map(str)
     if "recorded_at" in frame:
         recorded_at = pd.to_datetime(frame["recorded_at"], errors="coerce")
         frame["hour"] = recorded_at.dt.hour
@@ -244,6 +245,14 @@ def _pipeline(feature_set: dict[str, list[str]], classification: bool = False) -
     ])
 
 
+def _validation_period(frame: pd.DataFrame, split_at: int) -> dict[str, str]:
+    validation_times = frame["recorded_at"].iloc[split_at:]
+    return {
+        "start": validation_times.iloc[0].isoformat(sep=" ", timespec="seconds"),
+        "end": validation_times.iloc[-1].isoformat(sep=" ", timespec="seconds"),
+    }
+
+
 def train_model(db: Session) -> dict[str, Any]:
     frame = _training_frame(db)
     if len(frame) < MINIMUM_TRAINING_ROWS:
@@ -321,6 +330,14 @@ def train_model(db: Session) -> dict[str, Any]:
             "feature_names": FEATURES[name]["numeric"] + FEATURES[name]["categorical"],
             "training_rows": int(task_split),
             "validation_rows": int(len(task_frame) - task_split),
+            "validation_period": _validation_period(task_frame, task_split),
+            "validation_details": (
+                {}
+                if "r2" in metrics
+                else {
+                    "r2": "Unavailable because validation targets are constant or too few to score."
+                }
+            ),
             "metrics": metrics,
             "baseline": {"name": "DummyRegressor(mean)", "metrics": {
                 "mae": metrics["baseline_mae"],
@@ -372,6 +389,7 @@ def train_model(db: Session) -> dict[str, Any]:
             "feature_names": FEATURES["congestion"]["numeric"] + FEATURES["congestion"]["categorical"],
             "training_rows": int(class_split),
             "validation_rows": int(len(classifier_frame) - class_split),
+            "validation_period": _validation_period(classifier_frame, class_split),
             "metrics": class_metrics,
             "baseline": {
                 "name": "DummyClassifier(most_frequent)",
@@ -401,6 +419,10 @@ def train_model(db: Session) -> dict[str, Any]:
         "training_rows": training_rows,
         "validation_rows": int(len(frame) - split_at),
         "total_rows": int(len(frame)),
+        "validation_method": (
+            "Each output is evaluated on its later chronological eligible-row holdout; "
+            "the persisted model is then refit on all eligible rows."
+        ),
         "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "weather_used": False,
         "preprocessing": frame.attrs.get("preprocessing", {}),
@@ -429,22 +451,79 @@ def train_model(db: Session) -> dict[str, Any]:
 
 def model_status(db: Session) -> dict[str, Any]:
     path = model_path()
-    frame = _training_frame(db)
-    schema = frame.attrs.get("preprocessing", {}).get("schema", {})
+    readings = get_table("traffic_readings")
+    roads = get_table("road_segments")
+    required = {"segment_id", "recorded_at"}
+    missing = required.difference(readings.c.keys())
+    if missing:
+        raise ValueError(
+            f"traffic_readings is missing required model columns: {', '.join(sorted(missing))}."
+        )
+    if "segment_id" not in roads.c:
+        raise ValueError("road_segments is missing segment_id.")
+
+    selected = [readings.c.segment_id, readings.c.recorded_at]
+    for name in ("speed_kmh", "vehicle_count", "congestion_level", "travel_time_minutes"):
+        if name in readings.c:
+            selected.append(readings.c[name])
+    if "length_km" in roads.c:
+        selected.append(roads.c.length_km.label("road_length_km"))
+    distinct_readings = (
+        select(*selected)
+        .select_from(readings.join(roads, readings.c.segment_id == roads.c.segment_id))
+        .distinct()
+        .subquery()
+    )
+
+    def valid_numeric_count(column_name: str) -> Any:
+        if column_name not in distinct_readings.c:
+            return literal(0)
+        value = distinct_readings.c[column_name]
+        return func.coalesce(
+            func.sum(case((value.is_not(None) & (value >= 0), 1), else_=0)),
+            0,
+        )
+
+    eligible_statement = select(
+        func.count().label("total_rows"),
+        valid_numeric_count("travel_time_minutes").label("travel_time"),
+        valid_numeric_count("vehicle_count").label("traffic_volume"),
+        (
+            func.count(
+                func.distinct(
+                    func.nullif(
+                        func.lower(func.trim(distinct_readings.c.congestion_level)),
+                        "",
+                    )
+                )
+            )
+            if "congestion_level" in distinct_readings.c
+            else literal(0)
+        ).label("congestion_classes"),
+        (
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            distinct_readings.c.congestion_level.is_not(None)
+                            & (func.trim(distinct_readings.c.congestion_level) != ""),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            )
+            if "congestion_level" in distinct_readings.c
+            else literal(0)
+        ).label("congestion"),
+    ).select_from(distinct_readings)
+    database_summary = db.execute(eligible_statement).mappings().one()
+    schema_columns = set(readings.c.keys())
     rows_by_target = {
-        "travel_time": int(
-            (
-                pd.to_numeric(frame["travel_time_minutes"], errors="coerce").ge(0)
-                & np.isfinite(pd.to_numeric(frame["travel_time_minutes"], errors="coerce"))
-            ).sum()
-        ),
-        "traffic_volume": int(
-            (
-                pd.to_numeric(frame["vehicle_count"], errors="coerce").ge(0)
-                & np.isfinite(pd.to_numeric(frame["vehicle_count"], errors="coerce"))
-            ).sum()
-        ),
-        "congestion": int(frame["congestion_level"].notna().sum()),
+        "travel_time": int(database_summary["travel_time"]),
+        "traffic_volume": int(database_summary["traffic_volume"]),
+        "congestion": int(database_summary["congestion"]),
     }
     readiness: dict[str, Any] = {}
     for name, rows in rows_by_target.items():
@@ -453,7 +532,7 @@ def model_status(db: Session) -> dict[str, Any]:
             "traffic_volume": "vehicle_count",
             "congestion": "congestion_level",
         }[name]
-        target_exists = target_column in schema.get("traffic_readings", {})
+        target_exists = target_column in schema_columns
         readiness[name] = {
             "available": False,
             "eligible_rows": rows,
@@ -463,8 +542,10 @@ def model_status(db: Session) -> dict[str, Any]:
                 else f"At least {MINIMUM_TRAINING_ROWS} valid historical rows are required; found {rows}."
             ),
         }
-    class_counts = frame["congestion_level"].dropna().value_counts()
-    if rows_by_target["congestion"] >= MINIMUM_TRAINING_ROWS and len(class_counts) < 2:
+    if (
+        rows_by_target["congestion"] >= MINIMUM_TRAINING_ROWS
+        and int(database_summary["congestion_classes"]) < 2
+    ):
         readiness["congestion"]["detail"] = "At least two distinct congestion labels are required in the historical readings."
     elif rows_by_target["congestion"] >= MINIMUM_TRAINING_ROWS:
         readiness["congestion"]["detail"] = "Ready for chronological classification validation."
@@ -472,7 +553,7 @@ def model_status(db: Session) -> dict[str, Any]:
         return {
             "available": False,
             "detail": "No trained model artifact is available.",
-            "total_rows": int(len(frame)),
+            "total_rows": int(database_summary["total_rows"]),
             "minimum_training_rows": MINIMUM_TRAINING_ROWS,
             "eligible_rows": rows_by_target,
             "models": readiness,
@@ -483,7 +564,7 @@ def model_status(db: Session) -> dict[str, Any]:
         return {
             "available": False,
             "detail": "The saved model could not be loaded. Retrain the model.",
-            "total_rows": int(len(frame)),
+            "total_rows": int(database_summary["total_rows"]),
             "minimum_training_rows": MINIMUM_TRAINING_ROWS,
             "eligible_rows": rows_by_target,
             "models": readiness,
@@ -496,7 +577,7 @@ def model_status(db: Session) -> dict[str, Any]:
     return {
         "available": bool(fitted_models),
         "detail": "One or more trained models are available." if fitted_models else "No trained prediction models are available.",
-        "total_rows": int(len(frame)),
+        "total_rows": int(database_summary["total_rows"]),
         "minimum_training_rows": MINIMUM_TRAINING_ROWS,
         "eligible_rows": rows_by_target,
         **metadata,
@@ -553,6 +634,26 @@ def predict_travel_time(
     average_vehicles = pd.to_numeric(recent_frame.get("vehicle_count"), errors="coerce").mean() if "vehicle_count" in recent_frame else np.nan
     congestion_values = recent_frame.get("congestion_level", pd.Series(dtype=object)).dropna().astype(str)
     historical_congestion = congestion_values.mode().iloc[0] if not congestion_values.empty else None
+    normalized_congestion = congestion_values.str.lower()
+    classified_reading_count = int(len(normalized_congestion))
+    high_or_severe_count = int(normalized_congestion.isin({"high", "severe"}).sum())
+    recent_timestamps = recent_frame.get("recorded_at", pd.Series(dtype=object)).dropna()
+    observed_evidence = {
+        "reading_count": int(len(recent_frame)),
+        "classified_reading_count": classified_reading_count,
+        "high_or_severe_count": high_or_severe_count,
+        "high_or_severe_share": (
+            high_or_severe_count / classified_reading_count
+            if classified_reading_count
+            else None
+        ),
+        "from_recorded_at": (
+            recent_timestamps.min() if not recent_timestamps.empty else None
+        ),
+        "through_recorded_at": (
+            recent_timestamps.max() if not recent_timestamps.empty else None
+        ),
+    }
     speed_value = request.speed_kmh if request.speed_kmh is not None else average_speed
     vehicles_value = request.vehicle_count if request.vehicle_count is not None else average_vehicles
     congestion_value = request.current_congestion_level or historical_congestion
@@ -652,6 +753,7 @@ def predict_travel_time(
             "weather": weather,
             "weather_is_road_specific": False,
         },
+        "observed_evidence": observed_evidence,
         "model": artifact["metadata"],
     }
 

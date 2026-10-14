@@ -10,18 +10,17 @@ From `Frontend/` in a separate PowerShell terminal:
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-$env:API_BASE_URL = "http://127.0.0.1:8000/api"
+$env:API_BASE_URL = "http://localhost:8001/api"
 streamlit run app.py
 ```
 
 Configure MySQL, the JWT secret, and the first admin in `Backend/.env`, then start FastAPI in another terminal using `../Backend/README.md`.
 
 Frontend: `http://localhost:8501`  
-Backend API: `http://127.0.0.1:8000`  
-Swagger: `http://127.0.0.1:8000/docs`
+Backend API: `http://localhost:8001`; Swagger: `http://localhost:8001/docs`.
 
-If `ERR_CONNECTION_REFUSED` appears, the corresponding process is stopped or the configured address/port is incorrect. Use `API_BASE_URL` to point the frontend at the API base ending in `/api`. The dashboard refreshes every 60 seconds; record changes also refresh immediately after successful mutations.
+If `ERR_CONNECTION_REFUSED` appears, the corresponding process is stopped or the configured address/port is incorrect. Use `API_BASE_URL` to point the frontend at the API base ending in `/api`. The authenticated sidebar refresh button reloads the current page without changing its filters. The dashboard also retains its 60-second automatic refresh; record changes refresh after successful mutations.
 
 ## Screens
 
-Dashboard, Road Segments, Traffic Readings, Weather, Incidents, and Predictions & ML are available after sign-in. Forms use road-segment selectors from the API, and deletions require explicit confirmation. Weather is presented by its stored location and time, not attributed to a selected road. The prediction UI calls the backend model and never calculates or fills in demo predictions.
+After sign-in, the application provides the dashboard, historical traffic analysis, congestion-cause comparisons, model-based what-if analysis, road segments, traffic readings, weather, incidents, and ML prediction/records. Dashboard filters apply to stored database readings and charts without losing the current login. Weather comparisons use matching date/hour aggregates only; no weather-to-road mapping is assumed. Prediction records are searchable and filterable but cannot be manually created or edited. Training starts only from the Train/Retrain button and runs as a background job; the page polls for progress and displays the actual completion or error. Predict runs only after the Predict button. The JWT is carried in a short-lived, one-use ticket to an HttpOnly browser cookie so page and login survive ordinary browser reloads; it is not placed in a URL. Stored readings are not represented as live traffic, and the UI does not fabricate model predictions or metrics.
