@@ -18,19 +18,145 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    :root { --ink:#172b2a; --muted:#627572; --line:#dce6e2; --paper:#f5f8f6; --green:#146b58; --lime:#d8ed87; --coral:#c95c45; }
-    .stApp { background:var(--paper); color:var(--ink); }
-    [data-testid="stSidebar"] { background:#e8efeb; border-right:1px solid var(--line); }
-    [data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2 { color:var(--ink); }
-    h1,h2,h3 { color:var(--ink); letter-spacing:0; }
-    h1 { font-family:Georgia,serif; font-size:2.1rem; }
-    [data-testid="stMetric"] { background:#fff; border:1px solid var(--line); border-radius:6px; padding:14px 16px; }
-    [data-testid="stMetricLabel"] { color:var(--muted); }
-    [data-testid="stMetricValue"] { color:var(--green); }
-    div[data-testid="stForm"] { background:#fff; border:1px solid var(--line); border-radius:6px; padding:18px; }
-    .app-kicker { color:var(--green); text-transform:uppercase; font-size:0.76rem; font-weight:700; letter-spacing:0.12em; }
-    .app-note { color:var(--muted); font-size:0.9rem; }
-    div.stButton > button[kind="primary"] { background:var(--green); border-color:var(--green); }
+    :root {
+        color-scheme: dark;
+        --ink: #e6f2ff;
+        --muted: #91a7bb;
+        --line: rgba(111, 163, 197, 0.2);
+        --surface: #0d1724;
+        --surface-raised: #111f30;
+        --paper: #070b12;
+        --cyan: #22d3ee;
+        --blue: #438cff;
+        --teal: #2dd4bf;
+        --coral: #fb7185;
+    }
+    .stApp {
+        background:
+            radial-gradient(ellipse at 78% 0%, rgba(20, 91, 137, 0.16), transparent 38%),
+            var(--paper);
+        color: var(--ink);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    [data-testid="stAppViewContainer"], [data-testid="stMain"] { background: transparent; }
+    [data-testid="stHeader"] { background: rgba(7, 11, 18, 0.82); }
+    [data-testid="stMainBlockContainer"] { padding-top: 2rem; padding-bottom: 3rem; }
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0c1623 0%, #09111c 100%);
+        border-right: 1px solid var(--line);
+    }
+    [data-testid="stSidebar"] > div:first-child { background: transparent; }
+    [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3 { color: var(--ink); }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label { color: #b8c9d9; }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label:hover { color: var(--cyan); }
+    h1, h2, h3 {
+        color: var(--ink);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        letter-spacing: -0.025em;
+    }
+    h1 { font-size: clamp(1.8rem, 3vw, 2.55rem); font-weight: 720; line-height: 1.15; }
+    h2 { font-size: clamp(1.35rem, 2vw, 1.75rem); font-weight: 680; }
+    h3 { font-size: 1.15rem; font-weight: 640; }
+    p, label, [data-testid="stCaptionContainer"] { color: var(--muted); }
+    .app-kicker {
+        color: var(--cyan);
+        text-transform: uppercase;
+        font-size: 0.74rem;
+        font-weight: 750;
+        letter-spacing: 0.16em;
+        margin-bottom: 0.45rem;
+    }
+    .app-note { color: var(--muted); font-size: 0.9rem; }
+    [data-testid="stMetric"] {
+        background: linear-gradient(145deg, rgba(17, 31, 48, 0.98), rgba(11, 22, 35, 0.98));
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 16px 18px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), 0 0 18px rgba(34, 211, 238, 0.045);
+        min-height: 105px;
+    }
+    [data-testid="stMetricLabel"] { color: var(--muted); font-size: 0.82rem; }
+    [data-testid="stMetricValue"] { color: var(--cyan); font-weight: 700; }
+    [data-testid="stMetricDelta"] { color: var(--teal); }
+    div[data-testid="stForm"] {
+        background: linear-gradient(145deg, rgba(15, 27, 42, 0.98), rgba(10, 19, 31, 0.98));
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 20px;
+        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2);
+    }
+    [data-testid="stTabs"] [data-baseweb="tab-list"] {
+        border-bottom: 1px solid var(--line);
+        gap: 0.4rem;
+    }
+    [data-testid="stTabs"] [data-baseweb="tab"] { color: var(--muted); }
+    [data-testid="stTabs"] [aria-selected="true"] {
+        color: var(--cyan);
+        border-bottom-color: var(--cyan);
+    }
+    [data-testid="stDataFrame"], [data-testid="stTable"] {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        overflow: hidden;
+    }
+    [data-testid="stVegaLiteChart"], [data-testid="stArrowVegaLiteChart"] {
+        background: rgba(13, 23, 36, 0.72);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 8px;
+    }
+    [data-testid="stExpander"] {
+        background: rgba(13, 23, 36, 0.72);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+    }
+    [data-testid="stAlert"] { border-radius: 12px; }
+    [data-baseweb="input"] > div,
+    [data-baseweb="select"] > div,
+    [data-baseweb="textarea"] > div {
+        background-color: #0a1420;
+        border-color: rgba(111, 163, 197, 0.28);
+        border-radius: 9px;
+    }
+    [data-baseweb="input"] input, [data-baseweb="textarea"] textarea { color: var(--ink); }
+    [data-baseweb="input"] > div:focus-within,
+    [data-baseweb="select"] > div:focus-within,
+    [data-baseweb="textarea"] > div:focus-within {
+        border-color: var(--cyan);
+        box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.28);
+    }
+    div.stButton > button,
+    div[data-testid="stFormSubmitButton"] > button {
+        border: 1px solid rgba(111, 163, 197, 0.3);
+        border-radius: 9px;
+        transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+    }
+    div.stButton > button[kind="primary"],
+    div[data-testid="stFormSubmitButton"] > button[kind="primary"] {
+        background: linear-gradient(100deg, #087eaa, #2563eb);
+        border-color: rgba(34, 211, 238, 0.62);
+        color: #f2fcff;
+        box-shadow: 0 0 18px rgba(34, 211, 238, 0.16);
+    }
+    div.stButton > button:hover,
+    div[data-testid="stFormSubmitButton"] > button:hover {
+        border-color: var(--cyan);
+        box-shadow: 0 0 16px rgba(34, 211, 238, 0.14);
+        transform: translateY(-1px);
+    }
+    @media (max-width: 900px) {
+        [data-testid="stMainBlockContainer"] { padding: 1.4rem 1.25rem 2rem; }
+        [data-testid="stHorizontalBlock"] { flex-wrap: wrap; gap: 0.8rem; }
+        [data-testid="column"] { min-width: min(100%, 175px) !important; flex: 1 1 175px !important; }
+    }
+    @media (max-width: 520px) {
+        [data-testid="stMainBlockContainer"] { padding: 1rem 0.8rem 1.5rem; }
+        [data-testid="stHorizontalBlock"] { gap: 0.55rem; }
+        [data-testid="column"] { min-width: 100% !important; flex-basis: 100% !important; }
+        div[data-testid="stForm"] { padding: 14px; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -276,13 +402,13 @@ def dashboard() -> None:
         with chart_left:
             st.subheader("Speed trend · km/h")
             if "speed_kmh" in frame:
-                st.line_chart(frame.dropna(subset=["recorded_at"]).sort_values("recorded_at").set_index("recorded_at")["speed_kmh"])
+                st.line_chart(frame.dropna(subset=["recorded_at"]).sort_values("recorded_at").set_index("recorded_at")["speed_kmh"], color="#22d3ee")
             else:
                 st.info("Speed column is unavailable in the existing readings.")
         with chart_right:
             st.subheader("Travel-time trend · minutes")
             if "travel_time_minutes" in frame:
-                st.line_chart(frame.dropna(subset=["recorded_at"]).sort_values("recorded_at").set_index("recorded_at")["travel_time_minutes"])
+                st.line_chart(frame.dropna(subset=["recorded_at"]).sort_values("recorded_at").set_index("recorded_at")["travel_time_minutes"], color="#2dd4bf")
             else:
                 st.info("Travel-time column is unavailable in the existing readings.")
         st.subheader("Recent traffic readings")
@@ -298,7 +424,7 @@ def dashboard() -> None:
         st.caption("Segment comparison · average travel time (min)")
         if not comparisons.empty and "average_travel_time_minutes" in comparisons:
             comparisons["average_travel_time_minutes"] = pd.to_numeric(comparisons["average_travel_time_minutes"], errors="coerce")
-            st.bar_chart(comparisons.set_index("name")["average_travel_time_minutes"])
+            st.bar_chart(comparisons.set_index("name")["average_travel_time_minutes"], color="#438cff")
         else:
             st.info("No segment comparison data in this time window.")
     with analysis_cols[1]:
@@ -314,7 +440,7 @@ def dashboard() -> None:
         st.caption("Latest congestion by road segment")
         if classified_segments:
             congestion = pd.DataFrame({"congestion_level": CONGESTION_LEVELS, "segment_count": [int(latest_levels.get(level, 0)) for level in CONGESTION_LEVELS]})
-            st.bar_chart(congestion.set_index("congestion_level")["segment_count"])
+            st.bar_chart(congestion.set_index("congestion_level")["segment_count"], color="#2dd4bf")
         else:
             st.info("No in-range latest congestion classifications are stored.")
 
