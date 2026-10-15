@@ -1,5 +1,7 @@
 # FastAPI Backend Build Specification
 
+> Historical specification retained for reference. It describes a superseded prediction-oriented design. The current implementation and setup are documented in the repository [README](../README.md); future prediction, ML training, and prediction-table routes are not part of the current application.
+
 ## Project
 
 Build the backend for **Urban Traffic Congestion Analysis and Travel Time Prediction System**. Read the existing project first and reuse its files where practical.

@@ -12,7 +12,7 @@ class APIError(Exception):
 
 class APIClient:
     def __init__(self, base_url: str | None = None, timeout: int = 10):
-        self.base_url = (base_url or os.getenv("API_BASE_URL", "http://localhost:8001/api")).rstrip("/")
+        self.base_url = (base_url or os.getenv("API_BASE_URL", "http://localhost:8000/api")).rstrip("/")
         self.timeout = timeout
         self.token: str | None = None
 

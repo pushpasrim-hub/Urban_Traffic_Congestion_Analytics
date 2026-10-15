@@ -1,5 +1,7 @@
 # Streamlit Frontend Build Specification
 
+> Historical specification retained for reference. It describes a superseded prediction/CRUD design. The current implementation and setup are documented in the repository [README](../README.md); the current dashboard provides analytics and rule-based decision support without prediction workflows.
+
 ## Project
 
 Build the frontend for **Urban Traffic Congestion Analysis and Travel Time Prediction System**. This is a specification for GitHub Copilot. Inspect the existing workspace and reuse its Frontend folder/files where practical.
