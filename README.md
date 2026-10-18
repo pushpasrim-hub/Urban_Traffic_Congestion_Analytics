@@ -25,7 +25,7 @@ A local, data-driven dashboard for exploring recorded urban traffic conditions. 
 
 This college project provides a single dashboard for examining traffic readings, road segments, weather observations, and incidents from an existing MySQL database. The backend queries and summarizes stored data; the frontend presents it through tables, metrics, filters, and interactive charts. A separate decision-support view can generate evidence-linked recommendations using explicit rules.
 
-The application expects the database and its core tables to be provisioned already. It does not seed demo records, initialize or migrate the core schema, or change existing traffic tables at startup.
+The application expects the MySQL database and core traffic tables to be provisioned already. It does not seed or modify traffic records. Two additive migrations create only the authentication and recommendation tables needed by this application.
 
 ## Objectives
 
@@ -37,12 +37,13 @@ The application expects the database and its core tables to be provisioned alrea
 
 ## Key features
 
-- **Dashboard:** current database-derived KPIs and visual summaries.
+- **Secure sign-in:** Argon2 password hashing, database-backed users, expiring signed sessions, and logout.
+- **Dashboard:** database-derived KPIs and visual summaries.
 - **Traffic analytics:** inspect traffic readings by road segment and time range, including speed, travel time, vehicle counts, and congestion levels.
-- **Road segments:** browse the available road-segment inventory.
+- **Road segments:** browse, search, and manage road inventory, with dependent-record deletion protection.
 - **Weather monitoring:** review weather observations and, where records match, compare weather and traffic by exact road-endpoint location and recorded hour.
-- **Incident monitoring:** review incidents and filter for active incidents.
-- **Decision recommendations:** explicitly generate recommendations from latest high/severe readings and active incidents, with evidence summaries and duplicate protection.
+- **Incident monitoring:** filter and manage incidents; active/resolved/scheduled status is derived from start/end times.
+- **Decision recommendations:** explicitly generate and manage persistent recommendations from observed congestion, speed, vehicle-count, period, and active-incident evidence, with duplicate protection.
 - **API health and interactive documentation:** check service/database status and explore the FastAPI schema.
 
 ## System architecture
@@ -55,7 +56,7 @@ The application expects the database and its core tables to be provisioned alrea
 [Existing MySQL database: urban_traffic_db]
 ```
 
-The frontend does not connect directly to MySQL. The backend uses SQLAlchemy to reflect and query the existing schema. The `app.main` entry point mounts the status routes and decision-support API; other router and prediction-related modules present in the source tree are not mounted in this running application.
+The frontend does not connect directly to MySQL. The backend uses SQLAlchemy to reflect and query the existing schema. The `app.main` entry point mounts authentication, analytics, road, incident, weather, and recommendation-management routes. Prediction and machine-learning routers remain unmounted.
 
 ## Technology stack
 
@@ -121,8 +122,7 @@ The root `requirements.txt` also contains packages used by other/legacy modules 
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
-├── pytest.ini
-└── start_urban_traffic.bat
+└── pytest.ini
 ```
 
 The prediction and machine-learning named files above are present in the repository, but they are not included by `Backend/app/main.py` and do not provide features in the running API described here.
@@ -146,7 +146,13 @@ Create `Backend\.env` from the example if it does not exist:
 if (-not (Test-Path Backend\.env)) { Copy-Item .env.example Backend\.env }
 ```
 
-Edit `Backend\.env` locally and set `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASSWORD` for your MySQL installation. Keep `DB_NAME=urban_traffic_db`. The example also sets `FRONTEND_ORIGIN` to `http://localhost:8501`; change it only if the Streamlit origin is different. Do not commit `.env` or share database credentials.
+Edit `Backend\.env` locally and set `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and `JWT_SECRET_KEY` for your environment. Keep `DB_NAME=urban_traffic_db`. Generate a secret locally (do not copy a sample value into production):
+
+```powershell
+.\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+The example sets `FRONTEND_ORIGIN` to `http://localhost:8501`; change it only if the Streamlit origin is different. Do not commit `.env` or share database credentials/secrets.
 
 The application requires an existing database with the tables listed under [Database schema](#database-schema). To verify that MySQL can see the configured schema and its tables, use your local MySQL username:
 
@@ -155,6 +161,23 @@ mysql -u your_mysql_username -p -D urban_traffic_db -e "SHOW TABLES;"
 ```
 
 The `-p` option prompts for the password; do not put a password in the command. The application does not create or migrate the core tables. An empty database is not sufficient.
+
+### Create the additive application tables and initial administrator
+
+Run these two safe, additive migrations after the existing `road_segments` table is present:
+
+```powershell
+mysql -u your_mysql_username -p -D urban_traffic_db < Backend\migrations\001_traffic_app_users.sql
+mysql -u your_mysql_username -p -D urban_traffic_db < Backend\migrations\002_decision_recommendations.sql
+```
+
+The `-p` option prompts for the MySQL password. Then create the first administrator through the secure prompt (the password is not echoed or stored in source):
+
+```powershell
+.\.venv\Scripts\python.exe Backend\scripts\create_admin.py
+```
+
+The script also creates the authentication table if needed. Passwords are stored as Argon2 hashes. Set a unique `JWT_SECRET_KEY` in `Backend\.env` before starting the backend.
 
 ### 2. Create a Python environment and install dependencies
 
@@ -195,11 +218,9 @@ python -m streamlit run Frontend\app.py
 
 Open the dashboard at <http://localhost:8501>. Keep both terminals running while using the application.
 
-Alternatively, after creating `.venv` and configuring `Backend\.env`, run `.\start_urban_traffic.bat` from the repository root to open both services.
-
 ## Dashboard guide
 
-The sidebar contains **Dashboard**, **Traffic Analytics**, **Road Segments**, **Weather Monitoring**, **Incident Monitoring**, and **Decision Recommendations**. Road and date filters are applied to supported analytics and monitoring views. The dashboard reads the records currently in MySQL; displayed metrics are not forecasts.
+Sign in with the administrator created above. All data and management API endpoints require a valid bearer session; logout revokes the current token. The sidebar contains **Dashboard**, **Traffic Analytics**, **Road Segments**, **Weather Monitoring**, **Incident Monitoring**, and **Decision Recommendations**. Road/date and page-specific filters apply to the selected records; the dashboard reports only observed database values.
 
 ### Traffic analytics
 
@@ -215,38 +236,38 @@ Incident records include their type, description, road segment, start time, and 
 
 ### Decision recommendations
 
-Recommendations are generated only when a user clicks **Analyze current evidence**. The rules are:
+Choose a road, date, and time, then select **Analyze Traffic**. The backend analyzes the one-hour window starting at that time (inclusive, with the end exclusive) using stored traffic readings and recorded incidents for that road. This is a historical database analysis, not a live traffic feed. At least one reading with a recognized `low`, `moderate`/`medium`, `high`, or `severe` congestion label is needed; the result reports how many recognized readings were used. Readings with missing or unrecognized congestion labels are excluded from classification.
 
-| Stored evidence | Rule-based suggestion |
-|---|---|
-| Latest reading for a road segment is `high` | Medium priority: review signal timing and increase traffic monitoring. |
-| Latest reading for a road segment is `severe` | High priority: review diversion options and temporary traffic controls. |
-| Incident is currently active | High priority: monitor the incident response and review diversion options. |
+Classification thresholds are based on the share of those recognized readings: **High** when at least 50% are `high` or `severe`; otherwise **Moderate** when at least 50% are `moderate`, `high`, or `severe`; otherwise **Low**. If no classified readings exist, the page displays **Insufficient Data** and does not generate a recommendation. Recommendations are explainable rule-based suggestions, informed by recorded speed/vehicle metrics when available and incidents overlapping the selected window; an incident record is contextual evidence, not proof of cause.
 
-Generated suggestions include an evidence summary based on the underlying reading or incident. When the `decision_recommendations` table is available, matching evidence is protected against duplicate insertion. Generation is not run on page refresh. If recommendation storage is missing, the API can return generated suggestions but does not save them.
-
-The optional helper `Backend\scripts\ensure_decision_recommendations_table.py` creates only the recommendation table if it is missing; it does not modify the other tables. It is not run automatically. Do not run it unless you intentionally want to add that optional table to your database.
+Migration 002 creates the recommendation table with the form's nullable context fields. Run `Backend\scripts\add_recommendation_context_columns.py` after the migration as a compatibility step for existing tables; it adds only missing nullable fields and preserves saved recommendations. The alternative helper `Backend\scripts\ensure_decision_recommendations_table.py` creates only that table if missing.
 
 ## API reference
 
-The running backend exposes the following routes. The other router modules in the source tree are not mounted by the current `app.main` entry point.
+All `/api` data routes below require authentication. `/health` remains available for service diagnostics.
 
 | Method and path | Purpose | Supported query parameters |
 |---|---|---|
 | `GET /` | Service name and status | - |
 | `GET /health` | MySQL connectivity and required-table status | - |
 | `GET /api/health` | Alias for the health response; omitted from the OpenAPI schema | - |
-| `GET /api/road-segments` | List road segments | `search`, `limit`, `offset` |
-| `GET /api/traffic-readings` | List traffic readings | `segment_id`, `start_time`, `end_time`, `congestion_level`, `limit`, `offset` |
-| `GET /api/weather` | List weather observations | `location`, `start_time`, `end_time`, `search`, `limit`, `offset` |
-| `GET /api/incidents` | List incidents | `segment_id`, `start_time`, `end_time`, `active_only`, `search`, `limit`, `offset` |
-| `GET /api/recommendations` | List saved recommendations and storage availability | `limit`, `offset` |
-| `POST /api/recommendations/generate` | Evaluate reading and active-incident rules; save when storage is available | `segment_id`, `start_time`, `end_time` |
-| `GET /api/analytics/summary` | Summary metrics from stored readings and incidents | `segment_id`, `start_time`, `end_time` |
-| `GET /api/analytics/congestion` | Counts grouped by congestion level | `segment_id`, `start_time`, `end_time` |
-| `GET /api/analytics/roads` | Aggregates grouped by road segment | `segment_id`, `start_time`, `end_time` |
+| `POST /api/auth/login` | Verify username/password and issue an expiring bearer token | JSON username/password |
+| `GET /api/auth/me` | Validate the current session | Bearer token |
+| `POST /api/auth/logout` | Revoke the current token | Bearer token |
+| `GET/POST /api/road-segments`, `GET/PATCH/PUT/DELETE /api/road-segments/{segment_id}` | Search/read/manage road segments; referenced roads cannot be silently removed | List: `search`, `limit`, `offset` |
+| `GET /api/traffic-readings` | Read-only traffic readings | `segment_id`, `road_type`, `start_time`, `end_time`, `from_time`, `to_time`, `congestion_level`, `limit`, `offset` |
+| `GET /api/weather`, `GET /api/weather/{weather_id}` | Read weather observations (monitoring only) | `location`, `start_time`, `end_time`, `condition`, `search`, `limit`, `offset` |
+| `GET/POST /api/incidents`, `GET/PATCH/PUT/DELETE /api/incidents/{incident_id}` | Read/manage incidents | `segment_id`, `start_time`, `end_time`, `active_only`, `incident_type`, `incident_status`, `search`, `limit`, `offset` |
+| `GET /api/recommendations` | List saved recommendations | `segment_id`, `start_time`, `end_time`, `priority`, `recommendation_status`, `limit`, `offset` |
+| `GET /api/recommendations/analyze` | Analyze one selected road and the one-hour window starting at `start_time`; returns observed classification, evidence, and a rule-based suggestion without saving a recommendation | `segment_id`, `start_time` |
+| `GET /api/recommendations/analysis` | Actual reading counts, averages, findings, and suggested actions by congestion category | `segment_id`, `start_time`, `end_time` |
+| `PATCH/DELETE /api/recommendations/{recommendation_id}` | Manage saved recommendations | JSON patch or ID |
+| `POST /api/recommendations/generate` | Generate and save category-based suggestions from selected readings | `segment_id`, `start_time`, `end_time` |
+| `GET /api/analytics/summary` | Summary metrics from stored readings and incidents | `segment_id`, `road_type`, `congestion_level`, `start_time`, `end_time`, `from_time`, `to_time` |
+| `GET /api/analytics/congestion` | Counts grouped by congestion level | `segment_id`, `road_type`, `congestion_level`, `start_time`, `end_time`, `from_time`, `to_time` |
+| `GET /api/analytics/roads` | Aggregates grouped by road segment | `segment_id`, `road_type`, `congestion_level`, `start_time`, `end_time`, `from_time`, `to_time` |
 
-`start_time` and `end_time` accept ISO 8601 datetimes and must form a valid range (`start_time` on or before `end_time`). Collection endpoints that support pagination default to a bounded result size; `limit` is at most 500. The OpenAPI docs at `/docs` provide request and response schemas.
+`start_time` and `end_time` accept ISO 8601 datetimes and must form a valid range (`start_time` on or before `end_time`). `from_time` and `to_time` filter by time of day and support ranges that cross midnight. Collection endpoints that support pagination default to a bounded result size; `limit` is at most 500. The OpenAPI docs at `/docs` provide request and response schemas.
 
 ## Database schema
 
@@ -258,11 +279,12 @@ The application reads the existing MySQL schema `urban_traffic_db`. The table an
 | `traffic_readings` | `reading_id` INTEGER (primary key); `segment_id` INTEGER; `recorded_at` DATETIME; `speed_kmh` DECIMAL(7,2); `vehicle_count` INTEGER; `travel_time_minutes` DECIMAL(8,2); `congestion_level` VARCHAR(20); `data_source` VARCHAR(30), default `sample` |
 | `weather_data` | `weather_id` INTEGER (primary key); `recorded_at` DATETIME; `location` VARCHAR(255); `temperature_c` FLOAT (nullable); `rainfall_mm` FLOAT (nullable); `condition` VARCHAR(100) (nullable) |
 | `incidents` | `incident_id` INTEGER (primary key); `segment_id` INTEGER; `incident_type` VARCHAR(120); `description` TEXT; `start_time` DATETIME; `end_time` DATETIME (nullable) |
-| `decision_recommendations` | `recommendation_id` INTEGER (auto-increment primary key); `segment_id` INTEGER (foreign key); `priority` VARCHAR(20); `recommendation_text` VARCHAR(500); `evidence_summary` TEXT; `created_at` DATETIME, default current timestamp; `status` VARCHAR(30), default `pending`; `deduplication_key` CHAR(64), unique |
+| `decision_recommendations` | `recommendation_id` INTEGER (auto-increment primary key); `segment_id` INTEGER (foreign key); `priority` VARCHAR(20); `recommendation_text` VARCHAR(500); `evidence_summary` TEXT; `problem_type` VARCHAR(40) (nullable); `congestion_severity` VARCHAR(20) (nullable); `problem_description` VARCHAR(500) (nullable); `created_at` DATETIME, default current timestamp; `status` VARCHAR(30), default `pending`; `deduplication_key` CHAR(64), unique |
+| `traffic_app_users` | `user_id` INTEGER (auto-increment primary key); `username` VARCHAR(120), unique; `password_hash` VARCHAR(255); `is_active` BOOLEAN; `token_version` INTEGER; `created_at` DATETIME |
 
 The recorded foreign keys are `traffic_readings.segment_id` and `incidents.segment_id` to `road_segments.segment_id`, and `decision_recommendations.segment_id` to `road_segments.segment_id`. Weather records are not linked to road segments.
 
-In the configured schema documented for this project, `traffic_readings.congestion_level` is VARCHAR rather than MySQL ENUM. The observed values are `low`, `moderate`, `high`, and `severe`. The application does not create, reset, or migrate the core tables. The recommendation table is optional for reading/analytics functionality, but required to persist generated recommendations.
+In the configured schema documented for this project, `traffic_readings.congestion_level` is VARCHAR rather than MySQL ENUM. The documented values are `low`, `moderate`, `high`, and `severe`. `traffic_readings.data_source` defaults to `sample`; treat such records as demonstration/sample data, not verified Chennai measurements. Core traffic tables are never migrated by this application. Run the two additive migrations to enable persistent login and recommendation management.
 
 ## Screenshots
 

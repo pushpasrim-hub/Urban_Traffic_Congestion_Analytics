@@ -1,3 +1,4 @@
+import logging
 import os
 
 from fastapi import FastAPI, Request
@@ -7,8 +8,10 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.database import engine
-from app.routers import decision_support
+from app.routers import auth, decision_support, incidents, roads, weather
+from app.routers.recommendations import router as recommendations_router
 
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Urban Traffic Congestion Analytics API",
@@ -31,7 +34,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth.router, prefix="/api")
 app.include_router(decision_support.router)
+app.include_router(roads.router, prefix="/api")
+app.include_router(incidents.router, prefix="/api")
+app.include_router(weather.router, prefix="/api")
+app.include_router(recommendations_router, prefix="/api")
 
 
 @app.get("/", tags=["Status"])
@@ -49,7 +57,8 @@ def health() -> dict[str, object] | JSONResponse:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
             existing = set(inspect(connection).get_table_names())
-    except SQLAlchemyError:
+    except SQLAlchemyError as exc:
+        logger.error("Database health check failed (%s).", type(exc).__name__)
         return JSONResponse(
             status_code=503,
             content={
@@ -88,8 +97,9 @@ def api_health() -> dict[str, object] | JSONResponse:
 
 
 @app.exception_handler(SQLAlchemyError)
-async def database_error_handler(_request: Request, _exc: SQLAlchemyError) -> JSONResponse:
+async def database_error_handler(_request: Request, exc: SQLAlchemyError) -> JSONResponse:
+    logger.error("Database request failed (%s).", type(exc).__name__)
     return JSONResponse(
         status_code=503,
-        content={"detail": "The database is unavailable or does not contain the required urban traffic tables."},
+        content={"detail": "A database operation failed. Check database connectivity and the configured schema."},
     )

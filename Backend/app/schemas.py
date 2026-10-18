@@ -11,19 +11,19 @@ class InputModel(BaseModel):
 
 
 class RoadSegmentCreate(InputModel):
-    name: str = Field(min_length=1, max_length=255)
-    start_location: str = Field(min_length=1, max_length=255)
-    end_location: str = Field(min_length=1, max_length=255)
-    length_km: float = Field(gt=0)
-    road_type: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=100)
+    start_location: str = Field(min_length=1, max_length=150)
+    end_location: str = Field(min_length=1, max_length=150)
+    length_km: float = Field(gt=0, allow_inf_nan=False)
+    road_type: str = Field(min_length=1, max_length=50)
 
 
 class RoadSegmentPatch(InputModel):
-    name: str | None = Field(default=None, min_length=1, max_length=255)
-    start_location: str | None = Field(default=None, min_length=1, max_length=255)
-    end_location: str | None = Field(default=None, min_length=1, max_length=255)
-    length_km: float | None = Field(default=None, gt=0)
-    road_type: str | None = Field(default=None, min_length=1, max_length=100)
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    start_location: str | None = Field(default=None, min_length=1, max_length=150)
+    end_location: str | None = Field(default=None, min_length=1, max_length=150)
+    length_km: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    road_type: str | None = Field(default=None, min_length=1, max_length=50)
 
 
 class TrafficReadingCreate(InputModel):
@@ -52,8 +52,8 @@ class TrafficReadingPatch(InputModel):
 class WeatherCreate(InputModel):
     recorded_at: datetime
     location: str = Field(min_length=1, max_length=255)
-    temperature_c: float | None = None
-    rainfall_mm: float | None = Field(default=None, ge=0)
+    temperature_c: float | None = Field(default=None, allow_inf_nan=False)
+    rainfall_mm: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     condition: str | None = Field(default=None, max_length=100)
 
     @field_validator("recorded_at")
@@ -65,8 +65,8 @@ class WeatherCreate(InputModel):
 class WeatherPatch(InputModel):
     recorded_at: datetime | None = None
     location: str | None = Field(default=None, min_length=1, max_length=255)
-    temperature_c: float | None = None
-    rainfall_mm: float | None = Field(default=None, ge=0)
+    temperature_c: float | None = Field(default=None, allow_inf_nan=False)
+    rainfall_mm: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     condition: str | None = Field(default=None, max_length=100)
 
 
@@ -93,6 +93,29 @@ class IncidentPatch(InputModel):
     description: str | None = Field(default=None, min_length=1)
     start_time: datetime | None = None
     end_time: datetime | None = None
+
+
+class RecommendationPatch(InputModel):
+    priority: Literal["high", "medium", "low"] | None = None
+    recommendation_text: str | None = Field(default=None, min_length=1, max_length=500)
+    status: Literal["pending", "suggested", "reviewed", "implemented"] | None = None
+
+
+class RecommendationCreate(InputModel):
+    segment_id: int = Field(gt=0)
+    problem_type: Literal[
+        "Traffic Congestion", "Accident", "Vehicle Breakdown", "Roadwork", "Other"
+    ]
+    congestion_severity: Literal["Moderate", "High", "Severe"]
+    problem_description: str = Field(min_length=1, max_length=500)
+
+    @field_validator("problem_description")
+    @classmethod
+    def validate_problem_description(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Provide a brief description of the reported issue.")
+        return cleaned
 
 
 class PredictionCreate(InputModel):

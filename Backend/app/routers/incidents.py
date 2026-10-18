@@ -5,4 +5,12 @@ from app.schemas import IncidentCreate, IncidentPatch
 
 router = APIRouter()
 
-register_crud_routes(router, "/incidents", "incidents", "incident_id", IncidentCreate, IncidentPatch)
+register_crud_routes(
+    router,
+    "/incidents",
+    "incidents",
+    "incident_id",
+    IncidentCreate,
+    IncidentPatch,
+    include_list=False,
+)

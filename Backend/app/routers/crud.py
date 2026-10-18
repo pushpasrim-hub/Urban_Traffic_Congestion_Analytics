@@ -3,7 +3,7 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, status
 from pydantic import BaseModel, ValidationError
-from sqlalchemy import DateTime, Table, func, insert, or_, select, update
+from sqlalchemy import DateTime, MetaData, Table, func, insert, inspect, or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -72,18 +72,68 @@ def _fetch_item(db: Session, table: Table, primary_key: str, item_id: int) -> di
     return dict(row)
 
 
-def _check_road_references(db: Session, segment_id: int) -> None:
-    for related_name in ("traffic_readings", "incidents", "traffic_predictions"):
-        related = get_table(related_name)
-        if "segment_id" not in related.c:
+def _road_reference_tables(db: Session) -> dict[str, tuple[Table, list[str]]]:
+    inspector = inspect(db.get_bind())
+    existing_tables = set(inspector.get_table_names())
+    known_related_tables = (
+        "traffic_readings",
+        "incidents",
+        "decision_recommendations",
+        "traffic_predictions",
+    )
+    references: dict[str, tuple[Table, list[str]]] = {}
+    for table_name in known_related_tables:
+        if table_name in existing_tables:
+            related = get_table(table_name)
+            if "segment_id" in related.c:
+                references[table_name] = (related, ["segment_id"])
+
+    for table_name in existing_tables.difference({"road_segments"}):
+        foreign_key_columns = [
+            column_name
+            for foreign_key in inspector.get_foreign_keys(table_name)
+            if foreign_key.get("referred_table") == "road_segments"
+            for column_name, referred_column in zip(
+                foreign_key.get("constrained_columns") or [],
+                foreign_key.get("referred_columns") or [],
+            )
+            if referred_column == "segment_id"
+        ]
+        if not foreign_key_columns:
             continue
+        if table_name in references:
+            related, column_names = references[table_name]
+        else:
+            related = Table(table_name, MetaData(), autoload_with=db.get_bind())
+            column_names = []
+        column_names.extend(name for name in foreign_key_columns if name not in column_names)
+        references[table_name] = (related, column_names)
+    return references
+
+
+def _road_reference_counts(db: Session, segment_id: int) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for table_name, (related, column_names) in _road_reference_tables(db).items():
         count = db.scalar(
-            select(func.count()).select_from(related).where(related.c.segment_id == segment_id)
+            select(func.count())
+            .select_from(related)
+            .where(or_(*(related.c[name] == segment_id for name in column_names)))
         )
+        if count:
+            counts[table_name] = int(count)
+    return counts
+
+
+def _check_road_references(db: Session, segment_id: int) -> None:
+    for related_name, count in _road_reference_counts(db, segment_id).items():
         if count:
             raise HTTPException(
                 status_code=409,
-                detail=f"Road segment is referenced by {related_name}; delete or reassign those records first.",
+                detail=(
+                    f"Road segment #{segment_id} cannot be deleted because {count} record(s) "
+                    f"in {related_name} reference it. No related records were deleted. "
+                    "Reassign those records to another road segment first, or keep this road segment."
+                ),
             )
 
 
@@ -96,6 +146,7 @@ def register_crud_routes(
     patch_schema: type[BaseModel],
     *,
     read_only: bool = False,
+    include_list: bool = True,
 ) -> None:
     def list_records(
         segment_id: int | None = None,
@@ -248,13 +299,23 @@ def register_crud_routes(
             db.commit()
         except IntegrityError:
             db.rollback()
+            if table_name == "road_segments":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Road segment #{item_id} cannot be deleted because related records "
+                        "still reference it. No related records were deleted. Reassign those "
+                        "records to another road segment first, or keep this road segment."
+                    ),
+                ) from None
             raise HTTPException(status_code=409, detail="This record is referenced by other records and cannot be deleted.") from None
         except SQLAlchemyError:
             db.rollback()
             raise HTTPException(status_code=503, detail="The database could not delete this record.") from None
         return {"detail": "Record deleted."}
 
-    router.add_api_route(path, list_records, methods=["GET"], response_model=list[dict], name=f"list_{table_name}")
+    if include_list:
+        router.add_api_route(path, list_records, methods=["GET"], response_model=list[dict], name=f"list_{table_name}")
     router.add_api_route(f"{path}/{{{primary_key}}}", get_record, methods=["GET"], response_model=dict, name=f"get_{table_name}")
     if not read_only:
         router.add_api_route(path, create_record, methods=["POST"], response_model=dict, status_code=status.HTTP_201_CREATED, name=f"create_{table_name}")

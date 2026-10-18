@@ -1,10 +1,11 @@
-from datetime import datetime
+from datetime import datetime, time
 import hashlib
 import json
+import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
-from sqlalchemy import and_, case, func, inspect, or_, select
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import and_, case, extract, func, inspect, or_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.sqltypes import String
@@ -12,11 +13,17 @@ from sqlalchemy.sql.sqltypes import String
 from app.database import engine
 from app.models import get_table
 from app.schemas import to_database_datetime
+from app.security import get_current_user
 
-router = APIRouter(prefix="/api", tags=["Traffic analytics"])
+router = APIRouter(
+    prefix="/api",
+    tags=["Traffic analytics"],
+    dependencies=[Depends(get_current_user)],
+)
 CORE_TABLES = ("road_segments", "traffic_readings", "weather_data", "incidents")
 CONGESTION_LEVELS = ("low", "moderate", "high", "severe")
 HIGH_CONGESTION = ("high", "severe")
+logger = logging.getLogger(__name__)
 
 
 def _table_exists(table_name: str) -> bool:
@@ -61,6 +68,29 @@ def _time_filters(
     return filters
 
 
+def _clock_filters(
+    table: Any,
+    from_time: time | None,
+    to_time: time | None,
+    column_name: str = "recorded_at",
+) -> list[Any]:
+    if from_time is None and to_time is None:
+        return []
+    if column_name not in table.c:
+        raise HTTPException(
+            status_code=422,
+            detail=f"The {table.name} table does not support time-of-day filtering.",
+        )
+    clock = func.time(table.c[column_name])
+    lower = from_time.isoformat() if from_time is not None else None
+    upper = to_time.isoformat() if to_time is not None else None
+    if lower is not None and upper is not None:
+        if from_time <= to_time:
+            return [clock >= lower, clock <= upper]
+        return [or_(clock >= lower, clock <= upper)]
+    return [clock >= lower] if lower is not None else [clock <= upper]
+
+
 def _search_filter(table: Any, search: str | None) -> Any | None:
     if not search:
         return None
@@ -80,8 +110,16 @@ def _list_records(
     segment_id: int | None = None,
     start_time: datetime | None = None,
     end_time: datetime | None = None,
+    from_time: time | None = None,
+    to_time: time | None = None,
     search: str | None = None,
     location: str | None = None,
+    weather_condition: str | None = None,
+    incident_type: str | None = None,
+    incident_status: str | None = None,
+    road_type: str | None = None,
+    priority: str | None = None,
+    recommendation_status: str | None = None,
     congestion_level: str | None = None,
     active_only: bool = False,
     limit: int = 500,
@@ -103,6 +141,38 @@ def _list_records(
                 detail=f"The {table_name} table does not support a location filter.",
             )
         statement = statement.where(table.c.location == location)
+    if weather_condition is not None:
+        if "condition" not in table.c:
+            raise HTTPException(status_code=422, detail="Weather condition filtering is unavailable.")
+        statement = statement.where(table.c.condition == weather_condition)
+    if incident_type is not None:
+        if "incident_type" not in table.c:
+            raise HTTPException(status_code=422, detail="Incident-type filtering is unavailable.")
+        statement = statement.where(table.c.incident_type == incident_type)
+    if road_type is not None:
+        if table_name == "road_segments":
+            if "road_type" not in table.c:
+                raise HTTPException(status_code=422, detail="Road-type filtering is unavailable.")
+            statement = statement.where(table.c.road_type == road_type)
+        elif "segment_id" in table.c:
+            roads = _table("road_segments")
+            if not {"segment_id", "road_type"}.issubset(roads.c.keys()):
+                raise HTTPException(status_code=422, detail="Road-type filtering is unavailable.")
+            statement = statement.join(roads, roads.c.segment_id == table.c.segment_id).where(
+                roads.c.road_type == road_type
+            )
+    if priority is not None:
+        if "priority" not in table.c:
+            raise HTTPException(status_code=422, detail="Priority filtering is unavailable.")
+        statement = statement.where(func.lower(table.c.priority) == priority.lower())
+    if recommendation_status is not None:
+        if "status" not in table.c:
+            raise HTTPException(status_code=422, detail="Recommendation-status filtering is unavailable.")
+        status_filter = recommendation_status.lower()
+        if table_name == "decision_recommendations" and status_filter in {"pending", "suggested"}:
+            statement = statement.where(func.lower(table.c.status).in_(("pending", "suggested")))
+        else:
+            statement = statement.where(func.lower(table.c.status) == status_filter)
     if congestion_level is not None:
         if "congestion_level" not in table.c:
             raise HTTPException(
@@ -119,22 +189,50 @@ def _list_records(
     time_column = "recorded_at"
     if table_name == "incidents":
         time_column = "start_time"
+    elif table_name == "decision_recommendations":
+        time_column = "created_at"
     statement = statement.where(*_time_filters(table, start_time, end_time, time_column))
+    statement = statement.where(*_clock_filters(table, from_time, to_time, time_column))
     search_condition = _search_filter(table, search)
     if search_condition is not None:
         statement = statement.where(search_condition)
 
     if active_only:
-        if "start_time" not in table.c or "end_time" not in table.c:
-            raise HTTPException(
-                status_code=422,
-                detail="Active incident filtering requires start_time and end_time columns.",
+        if "status" in table.c:
+            statement = statement.where(func.lower(table.c.status) == "active")
+        else:
+            if "start_time" not in table.c or "end_time" not in table.c:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Active incident filtering requires start_time and end_time columns.",
+                )
+            now = datetime.now()
+            statement = statement.where(
+                table.c.start_time <= now,
+                or_(table.c.end_time.is_(None), table.c.end_time >= now),
             )
-        now = datetime.now()
-        statement = statement.where(
-            table.c.start_time <= now,
-            or_(table.c.end_time.is_(None), table.c.end_time >= now),
-        )
+    if incident_status is not None:
+        if table_name != "incidents":
+            raise HTTPException(status_code=422, detail="Incident-status filtering is unavailable.")
+        if "status" in table.c:
+            statement = statement.where(
+                func.lower(table.c.status) == incident_status
+            )
+        else:
+            if not {"start_time", "end_time"}.issubset(table.c.keys()):
+                raise HTTPException(status_code=422, detail="Incident-status filtering is unavailable.")
+            now = datetime.now()
+            if incident_status == "active":
+                statement = statement.where(
+                    table.c.start_time <= now,
+                    or_(table.c.end_time.is_(None), table.c.end_time >= now),
+                )
+            elif incident_status == "resolved":
+                statement = statement.where(table.c.end_time < now)
+            elif incident_status == "scheduled":
+                statement = statement.where(table.c.start_time > now)
+            else:
+                raise HTTPException(status_code=422, detail="incident_status must be active, resolved, or scheduled.")
 
     order_name = next(
         (
@@ -168,7 +266,10 @@ def traffic_readings(
     segment_id: int | None = Query(default=None, gt=0),
     start_time: datetime | None = None,
     end_time: datetime | None = None,
+    from_time: time | None = None,
+    to_time: time | None = None,
     congestion_level: str | None = None,
+    road_type: str | None = None,
     limit: int = Query(default=500, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> list[dict[str, Any]]:
@@ -177,7 +278,10 @@ def traffic_readings(
         segment_id=segment_id,
         start_time=start_time,
         end_time=end_time,
+        from_time=from_time,
+        to_time=to_time,
         congestion_level=congestion_level,
+        road_type=road_type,
         limit=limit,
         offset=offset,
     )
@@ -188,6 +292,7 @@ def weather_records(
     location: str | None = Query(default=None, max_length=255),
     start_time: datetime | None = None,
     end_time: datetime | None = None,
+    condition: str | None = Query(default=None, max_length=100),
     search: str | None = Query(default=None, max_length=120),
     limit: int = Query(default=500, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -195,6 +300,7 @@ def weather_records(
     return _list_records(
         "weather_data",
         location=location,
+        weather_condition=condition,
         start_time=start_time,
         end_time=end_time,
         search=search,
@@ -209,6 +315,8 @@ def incidents(
     start_time: datetime | None = None,
     end_time: datetime | None = None,
     active_only: bool = False,
+    incident_type: str | None = Query(default=None, max_length=120),
+    incident_status: str | None = Query(default=None, pattern="^(active|resolved|scheduled)$"),
     search: str | None = Query(default=None, max_length=120),
     limit: int = Query(default=500, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -219,6 +327,8 @@ def incidents(
         start_time=start_time,
         end_time=end_time,
         active_only=active_only,
+        incident_type=incident_type,
+        incident_status=incident_status,
         search=search,
         limit=limit,
         offset=offset,
@@ -227,27 +337,272 @@ def incidents(
 
 @router.get("/recommendations")
 def recommendations(
+    segment_id: int | None = Query(default=None, gt=0),
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    priority: str | None = Query(default=None, pattern="^(high|medium|low)$"),
+    recommendation_status: str | None = Query(
+        default=None,
+        pattern="^(pending|suggested|reviewed|implemented)$",
+    ),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
-    if not _table_exists("decision_recommendations"):
+    try:
+        if not _table_exists("decision_recommendations"):
+            return {
+                "available": False,
+                "items": [],
+                "detail": "Recommendation storage is not available. Check the database setup.",
+            }
         return {
-            "available": False,
-            "items": [],
-            "detail": (
-                "The decision_recommendations table is not present in the configured database. "
-                "Recommendations can be generated from real records but cannot be saved."
+            "available": True,
+            "items": _list_records(
+                "decision_recommendations",
+                segment_id=segment_id,
+                start_time=start_time,
+                end_time=end_time,
+                priority=priority,
+                recommendation_status=recommendation_status,
+                limit=limit,
+                offset=offset,
             ),
+            "detail": None,
         }
-    return {
-        "available": True,
-        "items": _list_records(
-            "decision_recommendations",
-            limit=limit,
-            offset=offset,
+    except SQLAlchemyError:
+        logger.exception("Saved recommendations could not be loaded.")
+        raise HTTPException(
+            status_code=503,
+            detail="Saved recommendations could not be loaded. Check the database connection.",
+        ) from None
+
+
+def _category_suggestions(
+    *,
+    segment_id: int | None,
+    road_name: str,
+    total_readings: int,
+    counts: dict[str, int],
+    average_speed: Any,
+    average_travel_time: Any,
+    average_vehicle_count: Any,
+) -> list[dict[str, Any]]:
+    guidance = {
+        "low": (
+            "Maintain current traffic management and continue routine monitoring.",
+            "The selected readings are classified as low congestion; continue monitoring for changes.",
+            "Continue routine monitoring.",
+            "low",
         ),
-        "detail": None,
+        "moderate": (
+            "Monitor traffic during busy periods and review signal timing if moderate congestion persists.",
+            "Moderate congestion appears in the selected observations; monitor whether it persists before making larger changes.",
+            "Monitor peak periods and review signal timing if the pattern continues.",
+            "low",
+        ),
+        "high": (
+            "Review traffic signal timing and consider additional traffic management during observed high-congestion periods.",
+            "High congestion was recorded in the selected period; assess traffic flow and management needs for those periods.",
+            "Review signal timing and traffic-management coverage.",
+            "medium",
+        ),
+        "severe": (
+            "Assess diversion options and temporary traffic controls during observed severe-congestion periods.",
+            "Severe congestion was recorded in the selected period; assess safe response options using local conditions.",
+            "Review diversion options and temporary traffic controls.",
+            "high",
+        ),
     }
+    suggestions: list[dict[str, Any]] = []
+    for level in CONGESTION_LEVELS:
+        count = int(counts.get(level, 0))
+        if count == 0:
+            continue
+        recommendation, reason, action, priority = guidance[level]
+        if count > 1 and level in HIGH_CONGESTION:
+            finding = (
+                f"Repeated {level} congestion was recorded on {road_name}: "
+                f"{count} of {total_readings} readings."
+            )
+        else:
+            finding = (
+                f"{count} of {total_readings} recorded readings on {road_name} "
+                f"were classified as {level} congestion."
+            )
+        evidence_parts = [finding]
+        if average_speed is not None:
+            evidence_parts.append(
+                f"Average observed speed across the selected readings was {float(average_speed):.1f} km/h."
+            )
+        if average_travel_time is not None:
+            evidence_parts.append(
+                f"Average observed travel time across the selected readings was "
+                f"{float(average_travel_time):.1f} minutes."
+            )
+        if average_vehicle_count is not None:
+            evidence_parts.append(
+                f"Average recorded vehicle count was {float(average_vehicle_count):.0f} per reading."
+            )
+        suggestions.append({
+            "segment_id": segment_id,
+            "road_name": road_name,
+            "congestion_level": level,
+            "reading_count": count,
+            "total_readings": total_readings,
+            "priority": priority,
+            "finding": finding,
+            "evidence_summary": " ".join(evidence_parts),
+            "recommendation": recommendation.format(road_name=road_name),
+            "reason": reason,
+            "suggested_action": action,
+            "status": "pending",
+            "created_at": datetime.now(),
+        })
+    return suggestions
+
+
+def _recommendation_analysis(
+    db: Session,
+    segment_id: int | None,
+    start_time: datetime | None,
+    end_time: datetime | None,
+) -> dict[str, Any]:
+    readings = _table("traffic_readings")
+    required = {"segment_id", "congestion_level"}
+    if not required.issubset(readings.c.keys()):
+        raise HTTPException(
+            status_code=503,
+            detail="Traffic readings are missing segment or congestion-level columns required for recommendations.",
+        )
+
+    filters = _time_filters(readings, start_time, end_time)
+    if segment_id is not None:
+        filters.append(readings.c.segment_id == segment_id)
+
+    metric_columns = [
+        readings.c.segment_id,
+        func.count().label("total_readings"),
+    ]
+    if "speed_kmh" in readings.c:
+        metric_columns.append(func.avg(readings.c.speed_kmh).label("average_speed_kmh"))
+    if "vehicle_count" in readings.c:
+        metric_columns.append(func.avg(readings.c.vehicle_count).label("average_vehicle_count"))
+    if "travel_time_minutes" in readings.c:
+        metric_columns.append(
+            func.avg(readings.c.travel_time_minutes).label("average_travel_time_minutes")
+        )
+    metrics_query = select(*metric_columns).group_by(readings.c.segment_id)
+    if filters:
+        metrics_query = metrics_query.where(*filters)
+    metrics_by_segment = {
+        row["segment_id"]: dict(row)
+        for row in db.execute(metrics_query).mappings()
+    }
+
+    level_column = func.lower(func.trim(readings.c.congestion_level)).label("level")
+    distribution_query = (
+        select(readings.c.segment_id, level_column, func.count().label("reading_count"))
+        .group_by(readings.c.segment_id, level_column)
+    )
+    if filters:
+        distribution_query = distribution_query.where(*filters)
+    counts_by_segment: dict[int | None, dict[str, int]] = {}
+    for row in db.execute(distribution_query).mappings():
+        level = str(row["level"] or "other").strip().lower()
+        if level == "medium":
+            level = "moderate"
+        if level not in {*CONGESTION_LEVELS, "other"}:
+            level = "other"
+        counts = counts_by_segment.setdefault(
+            row["segment_id"], {**{name: 0 for name in CONGESTION_LEVELS}, "other": 0}
+        )
+        counts[level] += int(row["reading_count"])
+
+    roads = _table("road_segments")
+    road_names: dict[int, str] = {}
+    if {"segment_id", "name"}.issubset(roads.c.keys()):
+        road_names = {
+            row["segment_id"]: str(row["name"] or f"Road segment {row['segment_id']}")
+            for row in db.execute(select(roads.c.segment_id, roads.c.name)).mappings()
+        }
+    if segment_id is not None:
+        metrics_by_segment.setdefault(segment_id, {"total_readings": 0})
+        counts_by_segment.setdefault(
+            segment_id, {**{name: 0 for name in CONGESTION_LEVELS}, "other": 0}
+        )
+
+    overall_counts = {**{name: 0 for name in CONGESTION_LEVELS}, "other": 0}
+    for counts in counts_by_segment.values():
+        for level, count in counts.items():
+            overall_counts[level] += count
+
+    overall_columns = [func.count().label("total_readings")]
+    if "speed_kmh" in readings.c:
+        overall_columns.append(func.avg(readings.c.speed_kmh).label("average_speed_kmh"))
+    if "vehicle_count" in readings.c:
+        overall_columns.append(func.avg(readings.c.vehicle_count).label("average_vehicle_count"))
+    if "travel_time_minutes" in readings.c:
+        overall_columns.append(
+            func.avg(readings.c.travel_time_minutes).label("average_travel_time_minutes")
+        )
+    overall_query = select(*overall_columns).select_from(readings)
+    if filters:
+        overall_query = overall_query.where(*filters)
+    overall = dict(db.execute(overall_query).mappings().one())
+
+    segment_analyses: list[dict[str, Any]] = []
+    for current_segment_id, metrics in metrics_by_segment.items():
+        total = int(metrics.get("total_readings") or 0)
+        counts = counts_by_segment.get(
+            current_segment_id,
+            {**{name: 0 for name in CONGESTION_LEVELS}, "other": 0},
+        )
+        name = road_names.get(
+            current_segment_id,
+            "Unassigned road segment" if current_segment_id is None else f"Road segment {current_segment_id}",
+        )
+        suggestions = _category_suggestions(
+            segment_id=current_segment_id,
+            road_name=name,
+            total_readings=total,
+            counts=counts,
+            average_speed=metrics.get("average_speed_kmh"),
+            average_travel_time=metrics.get("average_travel_time_minutes"),
+            average_vehicle_count=metrics.get("average_vehicle_count"),
+        )
+        segment_analyses.append({
+            "segment_id": current_segment_id,
+            "road_name": name,
+            "total_readings": total,
+            "congestion_counts": counts,
+            "average_speed_kmh": metrics.get("average_speed_kmh"),
+            "average_vehicle_count": metrics.get("average_vehicle_count"),
+            "average_travel_time_minutes": metrics.get("average_travel_time_minutes"),
+            "suggestions": suggestions,
+        })
+    segment_analyses.sort(key=lambda item: (item["road_name"].casefold(), item["segment_id"] or 0))
+
+    return {
+        "scope": "selected_road" if segment_id is not None else "all_roads",
+        "segment_id": segment_id,
+        "total_readings": int(overall.get("total_readings") or 0),
+        "congestion_counts": overall_counts,
+        "average_speed_kmh": overall.get("average_speed_kmh"),
+        "average_vehicle_count": overall.get("average_vehicle_count"),
+        "average_travel_time_minutes": overall.get("average_travel_time_minutes"),
+        "segments": segment_analyses,
+    }
+
+
+@router.get("/recommendations/analysis")
+def recommendation_analysis(
+    segment_id: int | None = Query(default=None, gt=0),
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+) -> dict[str, Any]:
+    _validate_time_range(start_time, end_time)
+    with Session(engine) as session:
+        return _recommendation_analysis(session, segment_id, start_time, end_time)
 
 
 @router.get("/analytics/summary")
@@ -255,15 +610,29 @@ def analytics_summary(
     segment_id: int | None = Query(default=None, gt=0),
     start_time: datetime | None = None,
     end_time: datetime | None = None,
+    from_time: time | None = None,
+    to_time: time | None = None,
+    road_type: str | None = None,
+    congestion_level: str | None = None,
 ) -> dict[str, Any]:
     roads = _table("road_segments")
     readings = _table("traffic_readings")
     incidents_table = _table("incidents")
     filters = _time_filters(readings, start_time, end_time)
+    filters.extend(_clock_filters(readings, from_time, to_time))
     if segment_id is not None:
         if "segment_id" not in readings.c:
             raise HTTPException(status_code=503, detail="Traffic readings cannot be grouped by road segment.")
         filters.append(readings.c.segment_id == segment_id)
+    if congestion_level is not None:
+        if congestion_level not in CONGESTION_LEVELS:
+            raise HTTPException(status_code=422, detail="congestion_level must be low, moderate, high, or severe.")
+        filters.append(readings.c.congestion_level == congestion_level)
+    if road_type is not None:
+        if "road_type" not in roads.c or "segment_id" not in readings.c:
+            raise HTTPException(status_code=422, detail="Road-type filtering is unavailable.")
+        road_ids = select(roads.c.segment_id).where(roads.c.road_type == road_type)
+        filters.append(readings.c.segment_id.in_(road_ids))
 
     with Session(engine) as session:
         road_query = select(func.count()).select_from(roads)
@@ -271,6 +640,10 @@ def analytics_summary(
             if "segment_id" not in roads.c:
                 raise HTTPException(status_code=503, detail="Road segments are missing segment_id.")
             road_query = road_query.where(roads.c.segment_id == segment_id)
+        if road_type is not None:
+            if "road_type" not in roads.c:
+                raise HTTPException(status_code=422, detail="Road-type filtering is unavailable.")
+            road_query = road_query.where(roads.c.road_type == road_type)
         total_roads = int(session.scalar(road_query) or 0)
 
         reading_query = select(func.count()).select_from(readings)
@@ -312,11 +685,17 @@ def analytics_summary(
     return {
         "total_road_segments": total_roads,
         "total_recorded_vehicles": (
-            int(total_vehicles or 0) if "vehicle_count" in readings.c else None
+            (
+                int(total_vehicles or 0)
+                if total_readings > 0 and "vehicle_count" in readings.c
+                else None
+            )
         ),
         "average_speed_kmh": average_speed,
         "average_travel_time_minutes": average_travel_time,
-        "high_or_severe_readings": high_severe_count,
+        "high_or_severe_readings": (
+            high_severe_count if total_readings > 0 else None
+        ),
         "active_incidents": active_incidents,
         "total_traffic_readings": total_readings,
         "recommendations_storage_available": _table_exists("decision_recommendations"),
@@ -328,15 +707,33 @@ def congestion_analytics(
     segment_id: int | None = Query(default=None, gt=0),
     start_time: datetime | None = None,
     end_time: datetime | None = None,
+    from_time: time | None = None,
+    to_time: time | None = None,
+    road_type: str | None = None,
+    congestion_level: str | None = None,
 ) -> dict[str, Any]:
     readings = _table("traffic_readings")
     if "congestion_level" not in readings.c:
         raise HTTPException(status_code=503, detail="Traffic readings are missing congestion_level.")
     filters = _time_filters(readings, start_time, end_time)
+    filters.extend(_clock_filters(readings, from_time, to_time))
     if segment_id is not None:
         if "segment_id" not in readings.c:
             raise HTTPException(status_code=503, detail="Traffic readings are missing segment_id.")
         filters.append(readings.c.segment_id == segment_id)
+    if congestion_level is not None:
+        if congestion_level not in CONGESTION_LEVELS:
+            raise HTTPException(status_code=422, detail="congestion_level must be low, moderate, high, or severe.")
+        filters.append(readings.c.congestion_level == congestion_level)
+    if road_type is not None:
+        roads = _table("road_segments")
+        if not {"segment_id", "road_type"}.issubset(roads.c.keys()):
+            raise HTTPException(status_code=422, detail="Road-type filtering is unavailable.")
+        filters.append(
+            readings.c.segment_id.in_(
+                select(roads.c.segment_id).where(roads.c.road_type == road_type)
+            )
+        )
     statement = select(
         readings.c.congestion_level,
         func.count().label("reading_count"),
@@ -348,7 +745,7 @@ def congestion_analytics(
     counts = {level: 0 for level in CONGESTION_LEVELS}
     for row in rows:
         level = str(row["congestion_level"]).lower()
-        counts[level] = int(row["reading_count"])
+        counts[level] = counts.get(level, 0) + int(row["reading_count"])
     return {
         "distribution": [
             {"congestion_level": level, "reading_count": count}
@@ -363,6 +760,10 @@ def road_analytics(
     segment_id: int | None = Query(default=None, gt=0),
     start_time: datetime | None = None,
     end_time: datetime | None = None,
+    from_time: time | None = None,
+    to_time: time | None = None,
+    road_type: str | None = None,
+    congestion_level: str | None = None,
 ) -> list[dict[str, Any]]:
     roads = _table("road_segments")
     readings = _table("traffic_readings")
@@ -371,6 +772,11 @@ def road_analytics(
 
     conditions = [readings.c.segment_id == roads.c.segment_id]
     conditions.extend(_time_filters(readings, start_time, end_time))
+    conditions.extend(_clock_filters(readings, from_time, to_time))
+    if congestion_level is not None:
+        if congestion_level not in CONGESTION_LEVELS:
+            raise HTTPException(status_code=422, detail="congestion_level must be low, moderate, high, or severe.")
+        conditions.append(readings.c.congestion_level == congestion_level)
     statement = select(
         roads.c.segment_id,
         *(
@@ -403,6 +809,10 @@ def road_analytics(
     )
     if segment_id is not None:
         statement = statement.where(roads.c.segment_id == segment_id)
+    if road_type is not None:
+        if "road_type" not in roads.c:
+            raise HTTPException(status_code=422, detail="Road-type filtering is unavailable.")
+        statement = statement.where(roads.c.road_type == road_type)
     with Session(engine) as session:
         return [dict(row) for row in session.execute(statement).mappings().all()]
 
@@ -446,6 +856,32 @@ def _recommendation_candidates(
             for row in db.execute(select(road_table.c.segment_id, road_table.c.name)).mappings()
         }
 
+    metric_columns = [
+        readings.c.segment_id,
+        func.count().label("reading_count"),
+    ]
+    if "speed_kmh" in readings.c:
+        metric_columns.append(func.avg(readings.c.speed_kmh).label("average_speed_kmh"))
+    if "vehicle_count" in readings.c:
+        metric_columns.append(func.avg(readings.c.vehicle_count).label("average_vehicle_count"))
+    if "travel_time_minutes" in readings.c:
+        metric_columns.append(
+            func.avg(readings.c.travel_time_minutes).label("average_travel_time_minutes")
+        )
+    if "congestion_level" in readings.c:
+        metric_columns.append(
+            func.sum(
+                case((readings.c.congestion_level.in_(HIGH_CONGESTION), 1), else_=0)
+            ).label("high_or_severe_count")
+        )
+    metric_query = select(*metric_columns).group_by(readings.c.segment_id)
+    if filters:
+        metric_query = metric_query.where(*filters)
+    metrics_by_segment = {
+        row["segment_id"]: dict(row)
+        for row in db.execute(metric_query).mappings()
+    }
+
     suggestions: list[dict[str, Any]] = []
     for row in latest_rows:
         level = str(row["congestion_level"]).lower()
@@ -477,6 +913,111 @@ def _recommendation_candidates(
             "created_at": datetime.now(),
         })
 
+    for segment_id_value, metrics in metrics_by_segment.items():
+        reading_count = int(metrics["reading_count"])
+        high_count = int(metrics.get("high_or_severe_count") or 0)
+        road_name = road_names.get(segment_id_value, f"Road segment {segment_id_value}")
+        average_speed = metrics.get("average_speed_kmh")
+        average_vehicles = metrics.get("average_vehicle_count")
+        average_travel_time = metrics.get("average_travel_time_minutes")
+
+        if reading_count >= 3 and high_count >= 2:
+            evidence = (
+                f"{high_count} of {reading_count} observed readings on {road_name} "
+                "were classified high or severe congestion."
+            )
+            if average_speed is not None:
+                evidence += f" Mean observed speed was {float(average_speed):.1f} km/h."
+            if average_travel_time is not None:
+                evidence += (
+                    f" Mean observed travel time was "
+                    f"{float(average_travel_time):.1f} minutes."
+                )
+            suggestions.append({
+                "segment_id": segment_id_value,
+                "priority": "high" if high_count / reading_count >= 0.75 else "medium",
+                "recommendation": (
+                    f"Review signal timing, traffic management, and traffic-police coverage on {road_name}."
+                ),
+                "evidence_summary": evidence,
+                "status": "pending",
+                "created_at": datetime.now(),
+            })
+
+        if (
+            reading_count >= 3
+            and average_speed is not None
+            and float(average_speed) < 15
+        ):
+            suggestions.append({
+                "segment_id": segment_id_value,
+                "priority": "medium",
+                "recommendation": (
+                    f"Increase monitoring and review observed traffic flow on {road_name}."
+                ),
+                "evidence_summary": (
+                    f"Across {reading_count} readings, average observed speed on {road_name} "
+                    f"was {float(average_speed):.1f} km/h."
+                ),
+                "status": "pending",
+                "created_at": datetime.now(),
+            })
+
+        if (
+            reading_count >= 3
+            and average_vehicles is not None
+            and float(average_vehicles) >= 100
+        ):
+            suggestions.append({
+                "segment_id": segment_id_value,
+                "priority": "medium",
+                "recommendation": (
+                    f"Review junction capacity and signal coordination on {road_name}."
+                ),
+                "evidence_summary": (
+                    f"Across {reading_count} readings, the average recorded vehicle count "
+                    f"on {road_name} was {float(average_vehicles):.0f} vehicles per reading."
+                ),
+                "status": "pending",
+                "created_at": datetime.now(),
+            })
+
+    if "recorded_at" in readings.c and "congestion_level" in readings.c:
+        period_query = select(
+            readings.c.segment_id,
+            extract("hour", readings.c.recorded_at).label("observed_hour"),
+            func.count().label("reading_count"),
+            func.sum(
+                case((readings.c.congestion_level.in_(HIGH_CONGESTION), 1), else_=0)
+            ).label("high_or_severe_count"),
+        ).group_by(
+            readings.c.segment_id,
+            extract("hour", readings.c.recorded_at),
+        )
+        if filters:
+            period_query = period_query.where(*filters)
+        for row in db.execute(period_query).mappings():
+            count = int(row["reading_count"])
+            high_count = int(row["high_or_severe_count"] or 0)
+            if count < 2 or high_count < 2:
+                continue
+            segment_id_value = row["segment_id"]
+            road_name = road_names.get(segment_id_value, f"Road segment {segment_id_value}")
+            hour = int(row["observed_hour"])
+            suggestions.append({
+                "segment_id": segment_id_value,
+                "priority": "medium",
+                "recommendation": (
+                    f"Review traffic-management arrangements around {hour:02d}:00 on {road_name}."
+                ),
+                "evidence_summary": (
+                    f"{high_count} of {count} readings recorded during the {hour:02d}:00 hour "
+                    f"on {road_name} showed high or severe congestion."
+                ),
+                "status": "pending",
+                "created_at": datetime.now(),
+            })
+
     incidents_table = _table("incidents")
     if {"segment_id", "incident_type", "start_time", "end_time"}.issubset(incidents_table.c.keys()):
         now = datetime.now()
@@ -498,10 +1039,24 @@ def _recommendation_candidates(
             )
             if description:
                 evidence += f" Incident details: {description}"
+            metrics = metrics_by_segment.get(incident["segment_id"], {})
+            high_count = int(metrics.get("high_or_severe_count") or 0)
+            if high_count:
+                evidence += (
+                    f" The selected period also contains {high_count} high/severe "
+                    "congestion reading(s) on this segment."
+                )
+                recommendation = (
+                    f"Coordinate incident response and review safe diversion options for {name}."
+                )
+            else:
+                recommendation = (
+                    f"Monitor incident response and assess traffic conditions on {name}."
+                )
             suggestions.append({
                 "segment_id": incident["segment_id"],
                 "priority": "high",
-                "recommendation": f"Monitor the incident response and review diversion options for {name}.",
+                "recommendation": recommendation,
                 "evidence_summary": evidence,
                 "status": "pending",
                 "created_at": datetime.now(),
@@ -526,6 +1081,9 @@ def _insert_values(table: Any, suggestion: dict[str, Any]) -> tuple[dict[str, An
             "supporting_evidence",
             "reason",
         ),
+        "problem_type": ("problem_type",),
+        "congestion_severity": ("congestion_severity",),
+        "problem_description": ("problem_description",),
         "created_at": ("created_at", "created_on", "recommended_at"),
         "status": ("status", "recommendation_status"),
         "deduplication_key": ("deduplication_key",),
@@ -580,8 +1138,25 @@ def _insert_values(table: Any, suggestion: dict[str, Any]) -> tuple[dict[str, An
 
 
 def _persist_suggestion(db: Session, table: Any, suggestion: dict[str, Any]) -> bool:
+    if db.bind is not None and db.bind.dialect.name == "mysql":
+        suggestion = {
+            **suggestion,
+            "priority": str(suggestion.get("priority", "medium")).title(),
+            "status": {
+                "pending": "Suggested",
+                "suggested": "Suggested",
+                "reviewed": "Reviewed",
+                "implemented": "Implemented",
+            }.get(str(suggestion.get("status", "suggested")).lower(), "Suggested"),
+        }
+    stored_recommendation = suggestion["recommendation"]
+    if suggestion.get("reason"):
+        stored_recommendation += f"\n\nWhy this recommendation? {suggestion['reason']}"
+    if suggestion.get("suggested_action"):
+        stored_recommendation += f"\nSuggested action: {suggestion['suggested_action']}"
     suggestion = {
         **suggestion,
+        "recommendation": stored_recommendation,
         "deduplication_key": hashlib.sha256(
             json.dumps(
                 {
@@ -636,15 +1211,16 @@ def generate_recommendations(
     segment_id: int | None = Query(default=None, gt=0),
     start_time: datetime | None = None,
     end_time: datetime | None = None,
+    priority: str | None = Query(default=None, pattern="^(high|medium|low)$"),
 ) -> dict[str, Any]:
     _validate_time_range(start_time, end_time)
     with Session(engine) as session:
+        analysis = _recommendation_analysis(session, segment_id, start_time, end_time)
         suggestions = _recommendation_candidates(
-            session,
-            segment_id,
-            start_time,
-            end_time,
+            session, segment_id, start_time, end_time
         )
+        if priority is not None:
+            suggestions = [item for item in suggestions if item["priority"] == priority]
         storage_available = _table_exists("decision_recommendations")
         saved_count = 0
         detail: str | None = None
@@ -668,5 +1244,6 @@ def generate_recommendations(
             "generated_count": len(suggestions),
             "saved_count": saved_count,
             "items": suggestions,
+            "analysis": analysis,
             "detail": detail,
         }

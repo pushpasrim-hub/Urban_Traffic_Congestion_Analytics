@@ -50,6 +50,9 @@ decision_recommendations = Table(
     Column("priority", String(20), nullable=False),
     Column("recommendation_text", String(500), nullable=False),
     Column("evidence_summary", Text, nullable=False),
+    Column("problem_type", String(40), nullable=True),
+    Column("congestion_severity", String(20), nullable=True),
+    Column("problem_description", String(500), nullable=True),
     Column(
         "created_at",
         DateTime,

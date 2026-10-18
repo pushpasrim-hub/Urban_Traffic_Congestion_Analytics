@@ -44,13 +44,20 @@ class APIClient:
         if not response.ok:
             message = "The API rejected the request."
             try:
-                detail = response.json().get("detail")
+                error_body = response.json()
+                detail = error_body.get("detail")
                 if isinstance(detail, str):
                     message = detail
                 elif detail:
                     message = "; ".join(
                         str(item.get("msg", item)) if isinstance(item, dict) else str(item)
                         for item in detail
+                    )
+                missing_tables = error_body.get("missing_tables")
+                if isinstance(missing_tables, list) and missing_tables:
+                    message = (
+                        "The database is connected, but required tables are missing: "
+                        + ", ".join(str(table) for table in missing_tables)
                     )
             except (ValueError, AttributeError):
                 pass
