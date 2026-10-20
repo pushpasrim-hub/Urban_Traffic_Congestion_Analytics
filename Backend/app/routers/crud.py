@@ -223,6 +223,14 @@ def register_crud_routes(
         if table_name == "incidents" and values.get("end_time") and values["end_time"] < values["start_time"]:
             raise HTTPException(status_code=422, detail="end_time must not be earlier than start_time.")
         try:
+            if table_name == "road_segments" and table.c[primary_key].autoincrement is False:
+                highest_id = db.execute(
+                    select(table.c[primary_key])
+                    .order_by(table.c[primary_key].desc())
+                    .limit(1)
+                    .with_for_update()
+                ).scalar_one_or_none()
+                values[primary_key] = (highest_id or 0) + 1
             result = db.execute(insert(table).values(**values))
             db.commit()
             if result.inserted_primary_key and primary_key in table.c:

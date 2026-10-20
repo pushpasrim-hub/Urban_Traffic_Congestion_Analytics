@@ -747,18 +747,24 @@ def render_roads(segments: list[dict[str, Any]]) -> None:
             road_type = st.text_input("Road type")
             create_clicked = st.form_submit_button("Create road segment", type="primary")
         if create_clicked:
-            try:
-                api().post("road-segments", {
-                    "name": name.strip(),
-                    "start_location": start_location.strip(),
-                    "end_location": end_location.strip(),
-                    "length_km": length_km,
-                    "road_type": road_type.strip(),
-                })
-                st.success("Road segment saved to the database.")
-                st.rerun()
-            except APIError as error:
-                st.error(f"Road segment was not saved: {error}")
+            if not all((name.strip(), start_location.strip(), end_location.strip(), road_type.strip())):
+                st.error("Road name, start location, end location, and road type are required.")
+            elif length_km <= 0:
+                st.error("Road length must be greater than zero.")
+            else:
+                try:
+                    api().post("road-segments", {
+                        "name": name.strip(),
+                        "start_location": start_location.strip(),
+                        "end_location": end_location.strip(),
+                        "length_km": length_km,
+                        "road_type": road_type.strip(),
+                    })
+                    st.session_state["road_action_success"] = "Road segment saved to the database."
+                    st.rerun()
+                except APIError as error:
+                    st.error(f"Road segment was not saved: {error}")
+
 
     if segment_options:
         selected_id = st.selectbox(
@@ -783,18 +789,23 @@ def render_roads(segments: list[dict[str, Any]]) -> None:
             edited_type = st.text_input("Road type", value=str(selected.get("road_type") or ""))
             save_clicked = st.form_submit_button("Save road changes", type="primary")
         if save_clicked:
-            try:
-                api().patch(f"road-segments/{selected_id}", {
-                    "name": edited_name.strip(),
-                    "start_location": edited_start.strip(),
-                    "end_location": edited_end.strip(),
-                    "length_km": edited_length,
-                    "road_type": edited_type.strip(),
-                })
-                st.success("Road segment updated.")
-                st.rerun()
-            except APIError as error:
-                st.error(f"Road segment was not updated: {error}")
+            if not all((edited_name.strip(), edited_start.strip(), edited_end.strip(), edited_type.strip())):
+                st.error("Road name, start location, end location, and road type are required.")
+            elif edited_length <= 0:
+                st.error("Road length must be greater than zero.")
+            else:
+                try:
+                    api().patch(f"road-segments/{selected_id}", {
+                        "name": edited_name.strip(),
+                        "start_location": edited_start.strip(),
+                        "end_location": edited_end.strip(),
+                        "length_km": edited_length,
+                        "road_type": edited_type.strip(),
+                    })
+                    st.session_state["road_action_success"] = "Road segment updated."
+                    st.rerun()
+                except APIError as error:
+                    st.error(f"Road segment was not updated: {error}")
 
         confirm_delete = st.checkbox(
             "I confirm deleting this road segment",
